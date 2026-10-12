@@ -1,0 +1,8 @@
+# 本工具自身**不需要任何第三方依赖**：tkinter / urllib / json / csv 全部来自标准库，
+# 直接用系统 Python 3.8+ 即可运行（Windows 版 Python 自带 tkinter）。
+#
+# 可选增强：ACE「账号核查」明细里的截图预览需要 Pillow。
+# 不装也能正常使用，只是明细里不显示缩略图。需要时手动执行：
+#     pip install Pillow
+#
+# Pillow>=9.0

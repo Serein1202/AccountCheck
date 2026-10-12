@@ -1,0 +1,30 @@
+# ---- 凭据与授权（绝不入库）----
+license.key
+.license
+.amis_token.json
+ace_session_credentials.json
+*_token.json
+*_credentials.json
+
+# ---- 运行产物 ----
+查询结果/
+*.csv
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
