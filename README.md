@@ -65,16 +65,19 @@ AccountCheck/
 ├─ .github/workflows/
 │  └─ build-release.yml    # CI：push 到 main → 打包单文件 exe → 自检 → 发布 Releases
 ├─ joint_query.py          # 主入口：统一 GUI + 联合查询编排（同时查 amis 与 ACE）
-├─ amis_query.py           # amis 侧查询 + 共享的自绘 UI 组件（进度条 / 胶囊页签）
-├─ ace_query.py            # ACE 侧查询（含独立 GUI 与 --cli 文本模式）
-├─ sentry_bridge.py        # 错误上报（纯标准库直连 Sentry，异步 + 脱敏）
-├─ license_boot.py         # 授权接入层（启动校验 + 运行期看门狗）
-├─ license_config.py       # 授权服务地址 / app_id / 公钥
-└─ vendor/
-   └─ license_guard.py     # license-guard 官方 SDK（零依赖）
+├─ src/                    # 库模块
+│  ├─ amis_query.py        # amis 侧查询 + 共享的自绘 UI 组件（进度条 / 胶囊页签）
+│  ├─ ace_query.py         # ACE 侧查询（含独立 GUI 与 --cli 文本模式）
+│  ├─ sentry_bridge.py     # 错误上报（纯标准库直连 Sentry，异步 + 脱敏）
+│  ├─ license_boot.py      # 授权接入层（启动校验 + 运行期看门狗）
+│  ├─ license_config.py    # 授权服务地址 / app_id / 公钥
+│  └─ vendor/
+│     └─ license_guard.py  # license-guard 官方 SDK（零依赖）
+└─ docs/
+   └─ screenshot.png       # 界面截图
 ```
 
-`amis_query.py` / `ace_query.py` 也能单独运行（例如 `python ace_query.py --cli 12376323`），方便只用其中一侧时调试。
+`ace_query.py` 也能单独运行（例如 `python src/ace_query.py --cli 12376323`），方便只用其中一侧时调试。
 
 ## 使用说明
 
@@ -94,9 +97,8 @@ AccountCheck/
   1. 环境变量 `LICENSE_KEY` / `748291635_LICENSE_KEY` / `APP_LICENSE_KEY`
   2. 程序目录 `license.key`（打包成 exe 时 = exe 所在目录）
   3. 程序目录 `.license`
-  4. 程序目录 `vendor/license.key`
-  5. **打包内置**的 `license.key`（CI 从 Secret 注入、随 exe 一起打包，单文件模式解包在 `sys._MEIPASS`）
-  6. `%LOCALAPPDATA%\748291635\license.key`
+  4. **打包内置**的 `license.key`（CI 从 Secret 注入、随 exe 一起打包，单文件模式解包在 `sys._MEIPASS`）
+  5. `%LOCALAPPDATA%\748291635\license.key`
 - 仓库**不包含** `license.key`：从源码运行时请自行按上面的顺序放置；从 Releases 下载的 exe 已内置授权码，无需配置
 - 运行期会按服务端下发的 `heartbeat_sec` 周期性复查；被判失效时按服务端策略退出
 - 服务端返回**临时性错误**（边缘限流页、网关错误页）时会降级为「联不上」走离线容忍期，不会因为一次限流就打不开程序；真正的失效码（`LICENSE_EXPIRED` / `LICENSE_REVOKED` / `KEY_NOT_FOUND` …）仍严格按服务端策略处理
@@ -107,11 +109,11 @@ AccountCheck/
 
 `.github/workflows/build-release.yml`：**每次推送到 `main`（或手动触发）** 会自动完成
 
-1. 从 `joint_query.py` 提取 `VERSION`，校验 Secret 是否就绪
-2. 把仓库 Secret **`APP_LICENSE_KEY`** 写入 `license.key`
+1. 计算发布版本号：取 `joint_query.py` 里 `VERSION` 的前两段作主次版本，patch 位用 CI 构建号——**每推送一次自动 +1**（如 v1.0.3 → v1.0.4），并生成 `_build_version.py` 打进 exe（使 exe 内 `--version` 与 Release 名一致）
+2. 校验 Secret 是否就绪，把仓库 Secret **`APP_LICENSE_KEY`** 写入 `license.key`
 3. PyInstaller 打包成单文件 GUI exe（`--onefile --windowed`，内置授权码）
 4. **在打包产物里跑一次 `--selfcheck`**，退出码非 0 则中止发布（挡住"漏打模块 / 授权码没进包 / 冻结后路径写错"这类只在 exe 上暴露的问题）
-5. 生成 SHA256 校验和 → 上传 Artifact（存档 90 天）→ 覆盖更新 `latest` Release
+5. 生成 SHA256 校验和 → 上传 Artifact（存档 90 天）→ 以 `AccountCheck v1.0.N` 为名覆盖更新 `latest` Release
 
 ### 首次使用前必须配置 Secret
 

@@ -11,7 +11,7 @@
 
 ================ 组成与约定 ================
 
-· SDK 在 ``vendor/license_guard.py``（零第三方依赖），接入常量在 ``license_config.py``。
+· SDK 在 ``src/vendor/license_guard.py``（零第三方依赖），接入常量在 ``license_config.py``。
 · 策略（fail_mode / exit_code / offline_grace_days / heartbeat_sec）由**后端下发并覆盖**
   本地兜底值；本地那些只用于「连不上后端」的场景。客户端不写死策略。
 · 授权码（license key）查找顺序：
@@ -67,10 +67,13 @@ def load_error():
 
 
 def app_dir():
-    """程序所在目录（PyInstaller 打包后取 exe 所在目录）"""
+    """程序所在目录（打包后取 exe 所在目录；源码运行取入口脚本所在目录）"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return _HERE
+    # 源码运行：license.key 放在入口脚本（joint_query.py / ace_query.py）旁边。
+    # 本模块位于 src/ 子目录，_HERE 指向 src/，不是用户放授权码的地方。
+    entry = Path(sys.argv[0] or ".").resolve().parent
+    return entry if entry.is_dir() else _HERE
 
 
 def license_key_candidates():

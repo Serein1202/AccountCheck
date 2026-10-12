@@ -6,6 +6,9 @@ ace_session_credentials.json
 *_token.json
 *_credentials.json
 
+# ---- CI 构建时生成的版本文件 ----
+_build_version.py
+
 # ---- 运行产物 ----
 查询结果/
 *.csv

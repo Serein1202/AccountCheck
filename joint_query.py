@@ -75,13 +75,22 @@ else:
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+# 库模块集中在脚本目录的 src/ 子目录（amis/ace/sentry/license 及其 vendor）。
+# 源码运行时把 src/ 加进模块搜索路径；打包成 exe 后模块已由 PyInstaller 直接打包，
+# _MEIPASS 里没有 src/ 子目录，isdir 守卫会跳过。
+_MODULE_ROOT = os.path.dirname(os.path.abspath(__file__))
+_SRC_DIR = os.path.join(_MODULE_ROOT, "src")
+if os.path.isdir(_SRC_DIR) and _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 try:
     import amis_query
     import ace_query
-except Exception as _imp_err:            # 缺少同目录模块时给出可读提示
+except Exception as _imp_err:            # 缺少 src/ 下模块时给出可读提示
     raise SystemExit(
-        "无法导入同目录的 amis_query.py / ace_query.py：%s\n"
-        "请确认三个文件位于同一目录：\n  %s" % (_imp_err, SCRIPT_DIR)
+        "无法导入 src/ 目录下的 amis_query.py / ace_query.py：%s\n"
+        "请确认目录结构完整（库模块应位于脚本目录的 src\\ 子目录）：\n  %s"
+        % (_imp_err, _MODULE_ROOT)
     )
 
 try:                                     # 错误上报（Sentry）：缺失时静默降级，不影响主流程
@@ -98,6 +107,14 @@ except Exception as _lic_err:            # pragma: no cover - 仅在文件缺失
 APP_NAME = "账号封禁 · 联合查询"
 APP_TITLE = APP_NAME + "（amis + ACE）"
 VERSION = "1.0.0"
+
+# CI 打包时由工作流生成 _build_version.py（gitignore，不入库），用于把
+# 「每次 push 递增的发布版本号」带进 exe，使 --version 与 Release 名一致。
+try:
+    from _build_version import BUILD_VERSION
+except Exception:                        # 本地源码运行时没有该文件
+    BUILD_VERSION = ""
+
 OUTPUT_DIR_NAME = "查询结果"                 # 导出 CSV 的相对子目录名
 
 # 编号种类
@@ -3545,7 +3562,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.version:
-        print("%s v%s" % (APP_NAME, VERSION))
+        print("%s v%s%s" % (APP_NAME, VERSION,
+                            ("（build %s）" % BUILD_VERSION) if BUILD_VERSION else ""))
         return 0
     if args.selfcheck:
         return selfcheck()

@@ -30,13 +30,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(grep -oP '^VERSION\s*=\s*"\K[^"]+' joint_query.py | head -n1)
-          if [ -z "$VERSION" ]; then
+          # 基础版本取源码里的 VERSION 常量（如 1.0.0），patch 位用 CI 构建号：
+          # 每次推送 run_number 自动 +1 → 发布版本号随之递增（v1.0.3、v1.0.4…）
+          BASE=$(grep -oP '^VERSION\s*=\s*"\K[^"]+' joint_query.py | head -n1)
+          if [ -z "$BASE" ]; then
             echo "::error::未能从 joint_query.py 提取 VERSION，请检查该常量是否存在"
             exit 1
           fi
+          RUN_NUM=${{ github.run_number }}
+          VERSION="${BASE%.*}.${RUN_NUM}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "版本号：$VERSION"
+          echo "版本号：v$VERSION（base=$BASE，patch=build #${RUN_NUM}）"
+          # 生成构建版本文件，随 PyInstaller 打进 exe，使 exe 内 --version 与 Release 名一致
+          printf 'BUILD_VERSION = "%s"\n' "$VERSION" > _build_version.py
 
       # 关键一步：把仓库 Secret 里的授权码落到工作区的 license.key，
       # 随后由 PyInstaller 的 --add-data 打进 exe（运行期从 sys._MEIPASS 读取）。
@@ -77,7 +83,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean
           --onefile --windowed
           --name AccountCheck
-          --paths vendor
+          --paths src --paths src/vendor
           --hidden-import license_guard
           --add-data "license.key;."
           joint_query.py
@@ -111,7 +117,7 @@ jobs:
       - name: Upload build artifact (kept 90 days)
         uses: actions/upload-artifact@v4
         with:
-          name: AccountCheck-v${{ steps.ver.outputs.version }}-build${{ github.run_number }}
+          name: AccountCheck-v${{ steps.ver.outputs.version }}
           path: |
             dist/AccountCheck.exe
             dist/AccountCheck.exe.sha256
@@ -123,10 +129,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest build · v${{ steps.ver.outputs.version }} (build ${{ github.run_number }})
+          name: AccountCheck v${{ steps.ver.outputs.version }}
           make_latest: true
           body: |
-            **AccountCheck v${{ steps.ver.outputs.version }} · build ${{ github.run_number }}**
+            **AccountCheck v${{ steps.ver.outputs.version }}**（build #${{ github.run_number }}）
 
             | | |
             |---|---|
