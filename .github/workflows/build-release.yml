@@ -17,15 +17,15 @@ concurrency:
 
 jobs:
   build:
-    name: 打包并发布 exe
+    name: Build and release exe
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 读取版本号
+      - name: Read version
         id: ver
         shell: bash
         run: |
@@ -41,7 +41,7 @@ jobs:
       # 关键一步：把仓库 Secret 里的授权码落到工作区的 license.key，
       # 随后由 PyInstaller 的 --add-data 打进 exe（运行期从 sys._MEIPASS 读取）。
       # license.key 已在 .gitignore 中，不会被提交；Secret 在日志里由 GitHub 自动打码。
-      - name: 注入授权码（来自 Secret APP_LICENSE_KEY）
+      - name: Inject license key (secret APP_LICENSE_KEY)
         shell: bash
         env:
           APP_LICENSE_KEY: ${{ secrets.APP_LICENSE_KEY }}
@@ -54,17 +54,17 @@ jobs:
           printf '%s\n' "$APP_LICENSE_KEY" > license.key
           echo "已写入 license.key（长度 ${#APP_LICENSE_KEY}）"
 
-      - name: 记录构建时间
+      - name: Record build time
         id: meta
         shell: bash
         run: echo "time=$(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
 
-      - name: 安装 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装打包依赖
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install "pyinstaller==6.18.0" pillow
@@ -72,7 +72,7 @@ jobs:
       # --paths vendor + --hidden-import license_guard：
       # license_boot 是在运行时用 sys.path 动态加载 license_guard 的，
       # PyInstaller 静态分析看不到这个导入，必须显式告诉它去哪找、并强制打包。
-      - name: 打包成单文件 exe
+      - name: Build single-file exe
         run: >
           python -m PyInstaller --noconfirm --clean
           --onefile --windowed
@@ -84,7 +84,7 @@ jobs:
 
       # 打包产物必须真能跑起来才算成功：exe 里跑一次离线自检，退出码非 0 直接中止。
       # 这一条能挡住「漏打模块 / 授权码没进包 / 冻结后路径写错」这类只在 exe 上暴露的问题。
-      - name: 校验产物（在 exe 里跑离线自检）
+      - name: Verify artifact (run offline selfcheck inside the exe)
         shell: pwsh
         run: |
           if (-not (Test-Path ./dist/AccountCheck.exe)) {
@@ -99,7 +99,7 @@ jobs:
             exit 1
           }
 
-      - name: 生成校验和
+      - name: Generate checksum
         shell: pwsh
         run: |
           $hash = (Get-FileHash ./dist/AccountCheck.exe -Algorithm SHA256).Hash.ToLower()
@@ -108,7 +108,7 @@ jobs:
           Write-Host "SHA256: $hash"
           Write-Host "体积: $size MB"
 
-      - name: 上传构建产物（存档 90 天）
+      - name: Upload build artifact (kept 90 days)
         uses: actions/upload-artifact@v4
         with:
           name: AccountCheck-v${{ steps.ver.outputs.version }}-build${{ github.run_number }}
@@ -119,11 +119,11 @@ jobs:
 
       # 滚动发布：始终更新同一个 latest Release，下载链接固定不变。
       # 旧构建仍可在本次运行的 Artifacts 里找到（保留 90 天）。
-      - name: 发布到 Releases（滚动 latest）
+      - name: Publish to Releases (rolling latest)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: 最新构建 · v${{ steps.ver.outputs.version }} (build ${{ github.run_number }})
+          name: Latest build · v${{ steps.ver.outputs.version }} (build ${{ github.run_number }})
           make_latest: true
           body: |
             **AccountCheck v${{ steps.ver.outputs.version }} · build ${{ github.run_number }}**
