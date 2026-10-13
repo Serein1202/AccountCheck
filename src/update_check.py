@@ -90,6 +90,14 @@ class UpdateError(Exception):
     """更新过程中的可预期错误（网络、校验、权限等）"""
 
 
+class SourceMismatch(UpdateError):
+    """某个镜像给的文件长度与版本清单不符
+
+    latest 是滚动 tag，各镜像/CDN 的缓存刷新节奏并不一致：可能出现「清单已经是
+    新版、镜像还缓存着上一版」。这种源再怎么重试也没用，只能换源。
+    """
+
+
 # ---------------------------------------------------------------- 文本/路径小工具
 def state_dir():
     """状态目录（下载片段 / 缓存 / 日志）：%LOCALAPPDATA%\\AccountCheck"""
@@ -133,6 +141,24 @@ def current_exe():
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable)
     return ""
+
+
+def read_text(path):
+    """读一小段文本（用于记录下载片段的来源 URL）"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def write_text(path, text):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(text))
+        return True
+    except Exception:
+        return False
 
 
 def read_json(path):
@@ -505,21 +531,20 @@ def _fetch_into(part, url, expected_size=0, size_hint=0, notice=None,
         if status == 206:
             total = _parse_total(resp.headers.get("Content-Range")) or \
                 (have + clen if clen else 0)
-            if total and have and size_hint and total != size_hint:
-                # 远端文件换了：旧片段作废
-                _truncate(part)
-                have, status, total = 0, 200, 0
-                resp.close()
-                resp = http_get(url, timeout=TIMEOUT_CONNECT, notice=notice)
-                clen = int(resp.headers.get("Content-Length") or 0)
         else:
             total = clen
             if have:
                 if notice:
                     notice("该源不支持断点续传（已下 %s），改为重新下载整包" % _human(have))
                 have = 0                             # 服务器忽略 Range → 只能整包重下
+        if total and size_hint and total != size_hint:
+            # 这个源拿到的不是我们要的版本（CDN 缓存还没刷新）：换源，别在这儿耗
+            raise SourceMismatch("该镜像给的是另一个构建（长度 %s，期望 %s）"
+                                 % (_human(total), _human(size_hint)))
         mode = "ab" if have else "wb"
         done = have
+        # 记下这段数据是谁给的：换镜像续传时靠它判断能不能接着拼（见 download_update）
+        write_text(part + ".src", url)
         if progress:
             progress(done, total or size_hint or 0, None)
         with open(part, mode) as f:
@@ -552,6 +577,13 @@ def _truncate(path):
         pass
 
 
+def _remove_quiet(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
 def _human(n):
     n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB"):
@@ -563,11 +595,14 @@ def _human(n):
 human_size = _human                        # 对外别名（CLI / GUI 都用它格式化字节数）
 
 
-def probe_sources(urls, timeout=6, notice=None):
-    """并发探测各下载源的「首字节」响应，返回可用的源（按快慢排序）
+def probe_sources(urls, timeout=6, notice=None, expect_size=0):
+    """并发探测各下载源的「首字节」响应，返回可用的源（值得优先用的排前面）
 
-    国内直连 GitHub 下 Release 往往被限速到几十 KB/s，而公共加速站说不准哪个通；
-    与其按固定顺序闷头等超时，不如先并发问一圈，挑最快的那个再真正开下。
+    探三件事，都很便宜（每个源一个请求，只取 1 字节）：
+      · 通不通 —— 公共加速站说不准哪个还活着，与其按固定顺序等超时不如并发问一圈；
+      · 认不认 Range（回 206）—— 断线是常态，能续传的源才值得优先用；
+      · **长度对不对** —— latest 是滚动 tag，可能清单已更新而某些镜像还在缓存上一版，
+        这种源下到底也是错的，直接排到最后（全都对不上时才退回按速度用）。
     全部失败时返回空列表，由调用方退回原始顺序。
     """
     q = queue.Queue()
@@ -577,6 +612,10 @@ def probe_sources(urls, timeout=6, notice=None):
         try:
             resp = http_get(url, headers={"Range": "bytes=0-0"}, timeout=timeout, notice=None)
             code = resp.getcode()
+            if code == 206:
+                total = _parse_total(resp.headers.get("Content-Range"))
+            else:
+                total = int(resp.headers.get("Content-Length") or 0)
             try:
                 resp.read(16)
             except Exception:
@@ -585,29 +624,43 @@ def probe_sources(urls, timeout=6, notice=None):
                 resp.close()
             except Exception:
                 pass
-            q.put((code in (200, 206), url, time.time() - t0))
+            q.put((code in (200, 206), url, time.time() - t0, code == 206, total))
         except Exception as exc:                       # noqa: BLE001
-            q.put((False, url, _short(exc)))
+            q.put((False, url, _short(exc), False, 0))
 
     for url in urls:
         threading.Thread(target=run, args=(url,), daemon=True).start()
 
-    good, deadline = [], time.time() + max(1.0, float(timeout))
+    fresh, stale, deadline = [], [], time.time() + max(1.0, float(timeout))
     for _ in range(len(urls)):
         remain = deadline - time.time()
         if remain <= 0:
             break
         try:
-            ok, url, cost = q.get(timeout=remain)
+            ok, url, cost, resumable, total = q.get(timeout=remain)
         except queue.Empty:
             break
-        if ok:
-            good.append((cost, url))
-    good.sort(key=lambda x: x[0])
-    if good and notice:
-        notice("已探测可用下载源：%s" % "、".join("%s（%.1fs）" % (_host(u), c)
-                                                  for c, u in good[:3]))
-    return [u for _c, u in good]
+        if not ok:
+            continue
+        item = (0 if resumable else 1, cost, url)
+        if expect_size and total and total != expect_size:
+            stale.append(item)
+        else:
+            fresh.append(item)
+
+    pool = fresh or stale
+    if not pool:
+        return []
+    if not fresh and notice:
+        notice("注意：所有镜像的长度都与版本清单不符（CDN 缓存未同步），仍按速度尝试，"
+               "最终以 SHA256 校验为准")
+    pool.sort(key=lambda x: (x[0], x[1]))
+    if notice:
+        notice("已探测可用下载源：%s%s" % (
+            "、".join("%s（%.1fs%s）" % (_host(u), c, "，可续传" if p == 0 else "")
+                      for p, c, u in pool[:3]),
+            ("；另有 %d 个镜像缓存的是旧版本，已排到最后" % len(stale)) if stale else ""))
+    return [u for _p, _c, u in pool]
 
 
 def _download_source_priority(info):
@@ -632,12 +685,66 @@ def _download_source_priority(info):
     return urls
 
 
-def download_update(info, progress=None, notice=None, stop=None, max_rounds=3,
-                    dest_dir=None, probe=True):
+def _same_content_at_breakpoint(part, have, url, window=1 << 17):
+    """换源续传前的「拼接安全」校验：比对该源断点前的一段内容与本地片段
+
+    latest 是滚动 tag：不同镜像完全可能缓存着不同时刻的构建，直接拼起来会得到
+    「大小对得上、内容全错」的坏包。这里只取断点前最多 128 KB 做内容比对 ——
+    一致说明两份数据在拼接处同源，可以安全接着下；不一致就丢弃重下。
+    最终仍由 SHA256 兜底，这一步的职责是「别白下、也别拼坏」。
+    """
+    span = min(int(have), int(window))
+    if span <= 0:
+        return True
+    start = int(have) - span
+    try:
+        resp = http_get(url, headers={"Range": "bytes=%d-%d" % (start, have - 1)},
+                        timeout=TIMEOUT_CONNECT, notice=None)
+    except Exception:
+        return False
+    try:
+        if resp.getcode() not in (200, 206):
+            return False
+        data = resp.read(span + 32)
+    except Exception:
+        return False
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if len(data) < span:
+        return False
+    try:
+        with open(part, "rb") as f:
+            f.seek(start)
+            local = f.read(span)
+    except Exception:
+        return False
+    return local == data[:span]
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except Exception:
+        return 0
+
+
+def download_update(info, progress=None, notice=None, stop=None, max_rounds=2,
+                    dest_dir=None, probe=True, per_source_attempts=4,
+                    max_seconds=300):
     """下载新版 exe，支持断点续传；返回校验通过的本地文件路径
 
     progress(done, total, speed) 会被高频调用（UI 侧自行节流）；
     notice(text) 用于把「换源 / 续传 / 校验」等过程写进日志。
+
+    源的使用策略（针对「公共加速站经常下到一半就断」的现实）：
+      1) 先并发探测各源，挑「认 Range（能续传）」且响应快的；
+      2) 同一个源连着重试若干次 —— 断线多为偶发，同一份数据接着下最省流量；
+      3) 该源连续没有进展才换源；换源前核对断点前一段内容，对得上才接着拼，
+         对不上（可能是另一个构建 / 不支持 Range）就丢弃片段整包重下；
+      4) 收尾一律 SHA256 校验，只有校验通过才算成功。
     """
     version = info.get("version") or "unknown"
     size = int(info.get("size") or 0)
@@ -649,69 +756,115 @@ def download_update(info, progress=None, notice=None, stop=None, max_rounds=3,
     except Exception:
         pass
     dest, part = update_paths(version, folder)
-    if os.path.exists(dest) and want_sha:
-        if sha256_file(dest) == want_sha:                # 上次已经下好了
-            if notice:
-                notice("本地已有校验通过的新版安装包：%s" % dest)
-            return dest
+    if os.path.exists(dest) and want_sha and sha256_file(dest) == want_sha:
+        if notice:                                   # 上次已经下好并校验过了
+            notice("本地已有校验通过的新版安装包：%s" % dest)
+        return dest
 
     urls = _download_source_priority(info)
-    if probe and len(urls) > 1 and not (os.path.exists(part) and os.path.getsize(part)):
+    if probe and len(urls) > 1 and not _size(part):
         if notice:
             notice("正在探测最快的下载源（%d 个候选）…" % len(urls))
-        fast = probe_sources(urls, notice=notice)
+        fast = probe_sources(urls, notice=notice, expect_size=size)
         if fast:
             urls = fast + [u for u in urls if u not in fast]
+    # 已经有半截文件时，优先回到当初给数据那个源：latest 是滚动 tag，不同镜像
+    # 可能缓存着不同的构建，拼在一起就是「大小对得上、内容全错」的坏包。
+    source_marker = part + ".src"
+    origin = read_text(source_marker)
+    if origin and _size(part):
+        urls = [origin] + [u for u in urls if u != origin]
     _cleanup_old_parts(keep=part, folder=folder)
+
     last_err = None
+    deadline = time.time() + max(60.0, float(max_seconds))
     for round_no in range(1, max(1, max_rounds) + 1):
         for url in urls:
-            if stop and stop():
-                raise UpdateError("已取消")
-            have = os.path.getsize(part) if os.path.exists(part) else 0
-            if have and notice:
-                notice("从 %s 处续传（第 %d 轮）：%s" % (_human(have), round_no, _host(url)))
-            elif notice:
-                notice("开始下载（第 %d 轮）：%s" % (round_no, _host(url)))
-            t0 = time.time()
-            try:
-                _fetch_into(part, url, expected_size=size, size_hint=size,
-                            notice=notice, progress=progress)
-            except Exception as exc:                    # noqa: BLE001 - 换源重试
-                last_err = exc
-                got = os.path.getsize(part) if os.path.exists(part) else 0
+            for attempt in range(1, max(1, per_source_attempts) + 1):
+                if stop and stop():
+                    raise UpdateError("已取消")
+                if time.time() > deadline:
+                    raise UpdateError(
+                        "下载超时（已等 %d 秒）：镜像持续中断。已下载的片段已保留，"
+                        "稍后再试会从断点继续。" % int(max_seconds))
+                have = _size(part)
+                if have:
+                    origin = read_text(source_marker)
+                    if origin and origin != url:
+                        if _same_content_at_breakpoint(part, have, url):
+                            if notice:
+                                notice("换到 %s：断点处内容一致，从 %s 接着续传"
+                                       % (_host(url), _human(have)))
+                        else:
+                            if notice:
+                                notice("镜像 %s 接不上断点（内容不同或不支持 Range），"
+                                       "丢弃片段整包重下" % _host(url))
+                            _truncate(part)
+                            _remove_quiet(source_marker)
+                            have = 0
                 if notice:
-                    notice("该源中断（%s，已下 %s），换下一个源继续：%s"
-                           % (_short(exc), _human(got), url))
-                continue
-            got = os.path.getsize(part)
-            if size and got != size:
-                if notice:
-                    notice("大小不符（%s / 应为 %s），保留片段继续下载"
-                           % (_human(got), _human(size)))
-                last_err = UpdateError("下载不完整")
-                continue
-            speed = got / max(0.05, time.time() - t0)
-            if notice:
-                notice("下载完成：%s（平均 %s/s），开始校验…" % (_human(got), _human(speed)))
-            if want_sha:
-                if notice:
-                    notice("正在校验 SHA256…")
-                digest = sha256_file(part)               # 18MB 约 0.1~0.3s，不必报进度
-                if digest != want_sha:
+                    if have:
+                        notice("从 %s 处续传（%s · 第 %d 轮第 %d 次）"
+                               % (_human(have), _host(url), round_no, attempt))
+                    else:
+                        notice("开始下载（%s · 第 %d 轮第 %d 次）"
+                               % (_host(url), round_no, attempt))
+
+                t0 = time.time()
+                try:
+                    _fetch_into(part, url, expected_size=size, size_hint=size,
+                                notice=notice, progress=progress)
+                except SourceMismatch as exc:
+                    if notice:                              # 该镜像缓存了别的版本
+                        notice("%s，换下一个镜像" % exc)
+                    _truncate(part)                         # 片段来自这个源，一并作废
+                    _remove_quiet(source_marker)
+                    last_err = exc
+                    break                                   # 换源
+                except Exception as exc:                # noqa: BLE001 - 断线属常态
+                    last_err = exc
+                    got = _size(part)
+                    if got > have:
+                        if notice:
+                            notice("该源中断（%s），已下 %s；仍用同一个源接着下"
+                                   % (_short(exc), _human(got)))
+                        continue                        # 有进展 → 同一源继续续传
                     if notice:
-                        notice("SHA256 不符（%s…），丢弃已下内容重新下载" % digest[:12])
-                    _truncate(part)
-                    last_err = UpdateError("SHA256 校验失败")
+                        notice("该源没有数据下发（%s），换下一个源" % _short(exc))
+                    break                               # 毫无进展 → 换源
+
+                got = _size(part)
+                if size and got != size:
+                    if notice:
+                        notice("大小不符（%s / 应为 %s），保留片段继续下载"
+                               % (_human(got), _human(size)))
+                    last_err = UpdateError("下载不完整")
                     continue
+                if want_sha:
+                    if notice:
+                        notice("正在校验 SHA256…")
+                    digest = sha256_file(part)           # 18MB 约 0.1~0.3s，不必报进度
+                    if digest != want_sha:
+                        if notice:
+                            notice("SHA256 不符（%s…），丢弃已下内容并从别的源重下"
+                                   % digest[:12])
+                        _truncate(part)
+                        _remove_quiet(source_marker)
+                        last_err = UpdateError("SHA256 校验失败")
+                        break
+                    if notice:
+                        notice("SHA256 校验通过：%s…" % digest[:16])
+                try:
+                    os.replace(part, dest)
+                except Exception as exc:
+                    raise UpdateError("保存安装包失败：%s" % _short(exc))
+                _remove_quiet(source_marker)
                 if notice:
-                    notice("SHA256 校验通过：%s…" % digest[:16])
-            try:
-                os.replace(part, dest)
-            except Exception as exc:
-                raise UpdateError("保存安装包失败：%s" % _short(exc))
-            return dest
-    raise UpdateError("下载失败：%s" % _short(last_err) if last_err else "下载失败")
+                    notice("下载完成：%s（本次平均 %s/s）"
+                           % (_human(got), _human(got / max(0.05, time.time() - t0))))
+                return dest
+    raise UpdateError("下载失败：%s"
+                      % (_short(last_err) if last_err else "所有镜像均不可用"))
 
 
 def _host(url):
@@ -732,7 +885,8 @@ def _cleanup_old_parts(keep="", max_age_days=7, folder=None):
             path = os.path.join(folder, name)
             if path == keep or not os.path.isfile(path):
                 continue
-            limit = 86400 if name.endswith(".part") else max_age_days * 86400
+            limit = 86400 if (name.endswith(".part") or name.endswith(".src")) \
+                else max_age_days * 86400
             if (now - os.path.getmtime(path)) > limit:
                 try:
                     os.remove(path)
@@ -1052,23 +1206,24 @@ def offline_selftest(printer=None):
                          "版本比较 / 加速拼接 / 断点续传 / 校验 / 替换程序 全部通过")
 
 
-def _selftest_resume(say):
-    """用本地 HTTP 服务器验证断点续传：第一次故意截断，第二次带 Range 续传
-
-    覆盖三条关键路径：截断后保留 .part、带 Range 续传、服务器不支持 Range 时整包重下。
-    """
+def _start_test_server(payload, mode="normal", honor_range=True):
+    """起一个只服务本机自检的 HTTP 服务器，返回 (server, port, state)"""
     import http.server
     import socket
     import socketserver
 
-    payload = bytes((i * 7 + 13) % 251 for i in range(384 * 1024))
-    want = hashlib.sha256(payload).hexdigest()
-    state = {"mode": "truncate", "honor_range": True, "ranges": []}
+    state = {"mode": mode, "honor_range": honor_range, "ranges": [], "hits": 0}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
+            state["hits"] += 1
+            if state["mode"] == "fail":                 # 模拟「这个镜像挂了」
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             total = len(payload)
             start = 0
             rng = self.headers.get("Range") or ""
@@ -1085,9 +1240,8 @@ def _selftest_resume(say):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if state["mode"] == "truncate" and start == 0:
-                # 声明完整长度，却只发一半就断开 —— 客户端会读到 IncompleteRead，
-                # 正是「下载中途掉线」的真实形态。用 SHUT_WR 而非 close()，
-                # 免得 Windows 在缓冲未清空时发 RST 把已发数据一起丢掉。
+                # 声明完整长度，却只发一半就断开 —— 正是「下到一半掉线」的真实形态。
+                # 用 SHUT_WR 而非 close()，免得 Windows 在缓冲未清空时发 RST 把数据一起丢掉。
                 self.wfile.write(body[:len(body) // 2])
                 self.wfile.flush()
                 time.sleep(0.05)
@@ -1102,37 +1256,58 @@ def _selftest_resume(say):
         def log_message(self, *_a):
             pass
 
-    try:
-        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
-    except Exception as exc:                            # noqa: BLE001
-        return False, "无法启动本地测试服务器：%s" % _short(exc)
-    httpd.daemon_threads = True
-    port = httpd.server_address[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    class _QuietServer(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
 
+        def handle_error(self, request, client_address):
+            """客户端提前断开（截断场景）是自检的预期行为，不必打印堆栈"""
+
+    httpd = _QuietServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, httpd.server_address[1], state
+
+
+def _selftest_resume(say):
+    """用本地 HTTP 服务器验证断点续传（全程离线，不碰外网）
+
+    覆盖四条关键路径：
+      ① 下到一半掉线 → 保留 .part 供下次续传；
+      ② 恢复后按断点位置发 Range 接着下；
+      ③ 服务器不支持 Range（回 200）→ 退回整包重下；
+      ④ 换了镜像 → 丢弃旧片段重下（避免把两份不同的构建拼成「大小对、内容错」的坏包）。
+    """
+    payload = bytes((i * 7 + 13) % 251 for i in range(384 * 1024))
+    payload_b = bytes((i * 11 + 5) % 253 for i in range(384 * 1024))   # 等长但内容不同
+    want = hashlib.sha256(payload).hexdigest()
+    want_b = hashlib.sha256(payload_b).hexdigest()
+
+    servers = []
     tmpdir = tempfile.mkdtemp(prefix="ac_resume_")
-    url = "http://127.0.0.1:%d/%s" % (port, ASSET_EXE)
-    info = {"version": "9.9.9", "size": len(payload), "sha256": want, "exe_url": url}
-    dest, part = update_paths("9.9.9", tmpdir)
     old_env = os.environ.get(ENV_OFFLINE)
     # 只留直连（= 本地测试服务器）：确保截断那一轮没有第二个源能顶上，
     # 从而真正验证「失败后保留片段」这条路径。
     os.environ[ENV_OFFLINE] = "none"
     try:
-        # 第一轮：服务器截断 → 必须失败，且留下部分文件
+        srv, port, state = _start_test_server(payload, mode="truncate")
+        servers.append(srv)
+        url = "http://127.0.0.1:%d/%s" % (port, ASSET_EXE)
+        info = {"version": "9.9.9", "size": len(payload), "sha256": want, "exe_url": url}
+        dest, part = update_paths("9.9.9", tmpdir)
+
+        # ① 截断 → 必须失败，且留下可直接续传的片段
         try:
-            download_update(info, max_rounds=1, dest_dir=tmpdir)
+            download_update(info, max_rounds=1, per_source_attempts=1, dest_dir=tmpdir)
             return False, "截断场景下不应成功"
         except UpdateError:
             pass
-        part = dest + ".part"
         got = os.path.getsize(part) if os.path.exists(part) else 0
         if not (0 < got < len(payload)):
             return False, "截断后未保留可续传的片段（%s 字节）" % got
         if say:
-            say("      截断后保留片段 %s / %s" % (_human(got), _human(len(payload))))
+            say("      ① 掉线后保留片段 %s / %s" % (_human(got), _human(len(payload))))
 
-        # 第二轮：服务器恢复 → 必须带 Range 续传，且内容校验通过
+        # ② 恢复后用 Range 从断点续传
         state["mode"] = "normal"
         state["ranges"] = []
         path = download_update(info, max_rounds=2, dest_dir=tmpdir)
@@ -1140,17 +1315,67 @@ def _selftest_resume(say):
             return False, "续传后内容校验不一致"
         if not any(r == "bytes=%d-" % got for r in state["ranges"]):
             return False, "第二轮没有按断点位置发起续传（收到 %r）" % (state["ranges"][:3],)
+        if say:
+            say("      ② 按断点 %s 续传并校验通过" % _human(got))
 
-        # 第三轮：服务器不支持 Range（忽略 Range 头回 200）→ 应整包重下并成功
+        # ③ 服务器不支持 Range（忽略 Range 头回 200）→ 整包重下
         os.remove(path)
-        with open(dest + ".part", "wb") as f:           # 造一个「来源不同」的坏片段
+        with open(part, "wb") as f:                     # 造一个来源不明的半截片段
             f.write(payload[:len(payload) // 3])
         state["honor_range"] = False
         path = download_update(info, max_rounds=2, dest_dir=tmpdir)
         if sha256_file(path) != want:
             return False, "不支持 Range 时重下结果不一致"
         if say:
-            say("      续传 / 重下两条路径均校验通过")
+            say("      ③ 服务器不支持 Range 时整包重下成功")
+
+        # ④ 换到「内容相同」的镜像：应允许续传（公共镜像断线频繁，能接上就接）
+        os.remove(path)
+        srv_b, port_b, state_b = _start_test_server(payload)        # 同一份内容
+        servers.append(srv_b)
+        info_b = {"version": "9.9.9", "size": len(payload), "sha256": want,
+                  "exe_url": "http://127.0.0.1:%d/%s" % (port_b, ASSET_EXE)}
+        state["mode"] = "truncate"                      # 先用 A 做出半截片段
+        state["honor_range"] = True
+        try:
+            download_update(info, max_rounds=1, per_source_attempts=1, dest_dir=tmpdir)
+        except UpdateError:
+            pass
+        got = os.path.getsize(part) if os.path.exists(part) else 0
+        if not (0 < got < len(payload)):
+            return False, "换源场景的片段准备失败"
+        state["mode"] = "fail"                          # A 随后失效，只能换到 B
+        path = download_update(info_b, max_rounds=2, dest_dir=tmpdir)
+        if sha256_file(path) != want:
+            return False, "换到同内容镜像后校验不一致"
+        if not any(r == "bytes=%d-" % got for r in state_b["ranges"]):
+            return False, "换到同内容镜像后没有接着断点续传（收到 %r）" % (state_b["ranges"][:3],)
+        if say:
+            say("      ④ 换到内容相同的镜像：从 %s 处接着续传成功" % _human(got))
+
+        # ⑤ 换到「内容不同」的镜像：绝不能拼接，必须丢弃片段从新源整包重下
+        os.remove(path)
+        srv_c, port_c, state_c = _start_test_server(payload_b)      # 等长但不同内容
+        servers.append(srv_c)
+        info_c = {"version": "9.9.9", "size": len(payload_b), "sha256": want_b,
+                  "exe_url": "http://127.0.0.1:%d/%s" % (port_c, ASSET_EXE)}
+        state["mode"] = "truncate"
+        try:
+            download_update(info, max_rounds=1, per_source_attempts=1, dest_dir=tmpdir)    # A 再给半截
+        except UpdateError:
+            pass
+        got = os.path.getsize(part) if os.path.exists(part) else 0
+        if not (0 < got < len(payload)):
+            return False, "换源场景的片段准备失败（二）"
+        state["mode"] = "fail"
+        path = download_update(info_c, max_rounds=2, dest_dir=tmpdir)
+        if sha256_file(path) != want_b:
+            return False, "换源后拿到的不是新源的完整文件（很可能发生了跨源拼接）"
+        bad = [r for r in state_c["ranges"] if r == "bytes=%d-" % got]
+        if bad:
+            return False, "换源后仍从旧断点续传（收到 %r），会拼出坏文件" % bad[:2]
+        if say:
+            say("      ⑤ 换到内容不同的镜像：丢弃旧片段重下，未发生跨源拼接")
         return True, ""
     except Exception as exc:                            # noqa: BLE001
         return False, "续传自检异常：%s" % _short(exc)
@@ -1159,11 +1384,12 @@ def _selftest_resume(say):
             os.environ.pop(ENV_OFFLINE, None)
         else:
             os.environ[ENV_OFFLINE] = old_env
-        try:
-            httpd.shutdown()
-            httpd.server_close()
-        except Exception:
-            pass
+        for srv in servers:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
