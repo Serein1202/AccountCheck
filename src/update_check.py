@@ -809,6 +809,7 @@ def build_installer_script(new_exe, target, log_file=""):
         'set "NEW=%s"' % new_exe,
         'set "TGT=%s"' % target,
         'set "LOG=%s"' % log_file,
+        'echo %date% %time% installer started (bat)>> "%LOG%"',
         "set /a tries=0",
         ":retry",
         "set /a tries+=1",
@@ -844,6 +845,7 @@ _PS_TEMPLATE = r"""$ErrorActionPreference = 'Stop'
 $new = '__NEW__'
 $tgt = '__TGT__'
 $log = '__LOG__'
+try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('s') + ' installer started (powershell)') } catch {}
 $ok = $false
 for ($i = 1; $i -le 120; $i++) {
     try {
@@ -888,16 +890,45 @@ def build_installer_command(new_exe, target, log_file=""):
 
 
 def _detached_flags():
+    """替换程序的启动标志：新进程组 + 不显示窗口
+
+    特意**不用** DETACHED_PROCESS：它会让子进程完全没有控制台，而 PowerShell 5.1
+    启动时依赖控制台主机，实测结果是进程被创建但脚本一行都不执行（静默失效，
+    替换永远不会发生）。CREATE_NO_WINDOW 已经足够隐藏黑框，父进程退出也不会
+    带走子进程。
+    """
     flags = 0
-    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+    for name in ("CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
         flags |= getattr(subprocess, name, 0)
     return flags
 
 
-def launch_installer(new_exe, target=None, log_file="", notice=None):
-    """启动替换程序（本进程退出后它才可能成功覆盖）；返回描述字符串
+def _log_size(path):
+    try:
+        return os.path.getsize(path)
+    except Exception:
+        return 0
 
-    优先用 PowerShell（路径编码无忧），失败再退回 .bat 脚本。
+
+def _wait_log_growth(path, before, timeout=3.0):
+    """等外部替换程序「现身」：它会往同一个日志里写一行起始记录
+
+    这是对「进程创建成功但脚本一行都没跑」（例如 DETACHED_PROCESS 那次）
+    的兜底检测 —— 静默失效比报错更可怕，用户会以为已经更新了。
+    """
+    deadline = time.time() + max(0.5, float(timeout))
+    while time.time() < deadline:
+        if _log_size(path) > before:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def launch_installer(new_exe, target=None, log_file="", notice=None):
+    """启动替换程序（本进程退出后它才可能成功覆盖）；返回所用方式的描述
+
+    优先用 PowerShell（路径编码无忧），启动后确认它真的跑起来了，
+    否则退回 .bat 脚本。
     """
     target = target or current_exe()
     if not target:
@@ -909,25 +940,36 @@ def launch_installer(new_exe, target=None, log_file="", notice=None):
             % (os.path.dirname(target), new_exe))
     log_file = log_file or log_path()
 
-    exe = powershell_path()
-    if exe:
+    if powershell_path():
         try:
             cmd = build_installer_command(new_exe, target, log_file)
-            subprocess.Popen(cmd, close_fds=True, creationflags=_detached_flags())
             _log("install scheduled via powershell: %s -> %s" % (new_exe, target))
+            before = _log_size(log_file)
+            subprocess.Popen(cmd, close_fds=True, creationflags=_detached_flags())
+            if _wait_log_growth(log_file, before, 4.0):
+                if notice:
+                    notice("替换程序已接管：程序退出后会自动覆盖并重启到新版本")
+                return "powershell"
+            _log("powershell installer did not start; falling back to bat")
             if notice:
-                notice("已启动替换程序（PowerShell），程序退出后自动覆盖并重启")
-            return "powershell"
+                notice("替换程序未按预期启动，改用 .bat 兜底")
         except Exception as exc:                        # noqa: BLE001
             _log("powershell installer failed: %s" % _short(exc))
             if notice:
                 notice("PowerShell 方式启动失败（%s），改用 .bat 兜底" % _short(exc))
+
     script = build_installer_script(new_exe, target, log_file)
+    _log("install scheduled via bat: %s -> %s (script %s)" % (new_exe, target, script))
+    before = _log_size(log_file)
     subprocess.Popen(["cmd", "/c", script], close_fds=True,
                      creationflags=_detached_flags(), cwd=os.path.dirname(script))
-    _log("install scheduled via bat: %s -> %s (script %s)" % (new_exe, target, script))
+    if not _wait_log_growth(log_file, before, 4.0):
+        raise UpdateError(
+            "替换程序无法启动（PowerShell 与 .bat 都没跑起来），"
+            "自动更新被安全软件拦截的可能性较大。\n\n"
+            "请手动把下面的文件覆盖过去：\n%s\n→ %s" % (new_exe, target))
     if notice:
-        notice("已启动替换脚本（%s）" % script)
+        notice("替换脚本已接管：程序退出后会自动覆盖并重启到新版本")
     return script
 
 
