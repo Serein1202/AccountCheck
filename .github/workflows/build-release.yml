@@ -114,6 +114,37 @@ jobs:
           Write-Host "SHA256: $hash"
           Write-Host "体积: $size MB"
 
+      # 客户端「检查更新」优先读这个文件（几 KB、不受 GitHub API 限流影响）。
+      # 里面的 version 是 exe 内 --version 报的同一个值，供客户端与自身版本比较。
+      - name: Write latest.json (version manifest for the in-app updater)
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          exe = pathlib.Path("dist/AccountCheck.exe")
+          sha = pathlib.Path("dist/AccountCheck.exe.sha256").read_text().split()[0].strip().lower()
+          repo = os.environ["GITHUB_REPOSITORY"]
+          asset = "https://github.com/%s/releases/download/latest/AccountCheck.exe" % repo
+          manifest = {
+              "version": os.environ["APP_VERSION"],
+              "asset": exe.name,
+              "size": exe.stat().st_size,
+              "sha256": sha,
+              "commit": os.environ.get("GITHUB_SHA", ""),
+              "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "exe_url": asset,
+              "sha256_url": asset + ".sha256",
+          }
+          pathlib.Path("dist/latest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
       - name: Upload build artifact (kept 90 days)
         uses: actions/upload-artifact@v4
         with:
@@ -121,6 +152,7 @@ jobs:
           path: |
             dist/AccountCheck.exe
             dist/AccountCheck.exe.sha256
+            dist/latest.json
           retention-days: 90
 
       # 滚动发布：始终更新同一个 latest Release，下载链接固定不变。
@@ -145,8 +177,13 @@ jobs:
             **下载**：`AccountCheck.exe` —— 单文件、免安装，双击即用（Windows 10/11 x64）。
             文件校验和见 `AccountCheck.exe.sha256`。
 
+            程序内置自动更新：启动后会自动比对这里的 `latest.json`，发现新版本即
+            断点续传下载（内置多个加速镜像）并校验 SHA256，随后自动替换重启。
+            也可手动执行 `AccountCheck.exe --update`。
+
             > 本 Release 为滚动更新：每次推送到 `main` 都会覆盖这里的文件，下载链接固定不变。
             > 历史构建可在该次运行的 Actions → Artifacts 中下载（保留 90 天）。
           files: |
             dist/AccountCheck.exe
             dist/AccountCheck.exe.sha256
+            dist/latest.json

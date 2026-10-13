@@ -7,16 +7,23 @@
     python joint_query.py                 # 启动统一 GUI
     python joint_query.py --selfcheck      # 自检：导入 / 编号识别 / 模块接口 / 导出逻辑，不联网
     python joint_query.py --version        # 版本信息
+    python joint_query.py --check-update   # 只检查有没有新版本（联网）
+    python joint_query.py --update         # 检查 → 断点续传下载 → 校验 → 替换安装（联网）
 
 依赖：纯 Python 标准库（tkinter/ttk），无第三方包。
 程序结构：本文件是主入口与全部界面逻辑；查询引擎与支撑组件在 src/ 目录下
-（amis 侧、ACE 侧、Sentry 上报、授权接入）。
+（amis 侧、ACE 侧、Sentry 上报、授权接入、自动更新）。
 
 授权校验：启动时向 license-guard 校验授权码（不通过则按后端策略退出），
 相关文件为 src/license_boot.py（接入层，含服务地址/公钥）、
 src/vendor/license_guard.py（SDK）。授权码放在程序目录的 license.key，
 或用环境变量 LICENSE_KEY 提供。--version / --selfcheck / --test-sentry
 为排查用途，不做授权校验。
+
+自动更新：启动后（或点右上角「检查更新」）对比 GitHub Release 里的版本，
+有新版本即下载并替换正在运行的 exe。下载支持断点续传，并内置多个
+GitHub 加速镜像（见 src/update_check.py，可用环境变量
+JOINT_UPDATE_MIRRORS 覆盖）。设 JOINT_UPDATE_DISABLE=1 可整体关闭。
 
 ================================ 行为摘要 ================================
 1) 单入口：一个输入框批量粘贴编号，支持 逗号 / 空格 / 换行 / 分号 分隔，
@@ -38,6 +45,9 @@ src/vendor/license_guard.py（SDK）。授权码放在程序目录的 license.ke
    编号并发（AMIS_WORKERS / ACE_ACCOUNT_WORKERS）；ACE 单个编号里「可疑用户核查」
    与「数据查询」两条链路并行、处罚记录翻页也并行；ACE 接口另有在途请求总闸
    （ACE_INFLIGHT_LIMIT）防止瞬时并发过高。
+7) 自动更新：启动 6 秒后静默检查一次 GitHub Release，发现新版本时右上角状态
+   变黄并提示；点「检查更新」可手动检查、点状态可下载。下载走加速镜像且支持
+   断点续传，下完校验 SHA256，随后自动生成替换脚本重启到新版本。
 
 注意：本文件是「合并入口」，所有查询能力均来自 amis_query / ace_query，
      在此不重复实现业务逻辑，两个原始工具的命令行用法不受影响。
@@ -100,6 +110,13 @@ except Exception as _lic_err:            # pragma: no cover - 仅在文件缺失
     license_boot = None
     _LICENSE_BOOT_ERROR = _lic_err
 
+_UPDATE_IMPORT_ERROR = None
+try:                                     # 自动更新（检查新版 / 断点续传下载 / 自替换）
+    import update_check
+except Exception as _upd_err:            # pragma: no cover - 仅在文件缺失时发生
+    update_check = None
+    _UPDATE_IMPORT_ERROR = _upd_err
+
 APP_NAME = "账号封禁 · 联合查询"
 APP_TITLE = APP_NAME + "（amis + ACE）"
 VERSION = "1.0.0"
@@ -110,6 +127,13 @@ try:
     from _build_version import BUILD_VERSION
 except Exception:                        # 本地源码运行时没有该文件
     BUILD_VERSION = ""
+
+# 「检查更新」比较用的版本号：exe 里是 CI 生成的完整版本（如 1.0.7），
+# 源码运行时退回 VERSION。
+CURRENT_VERSION = BUILD_VERSION or VERSION
+
+# 启动后自动检查更新的延时（毫秒）：先让窗口和登录态检测跑起来，再悄悄问一次
+AUTO_UPDATE_DELAY_MS = 6000
 
 OUTPUT_DIR_NAME = "查询结果"                 # 导出 CSV 的相对子目录名
 
@@ -2802,6 +2826,11 @@ class JointApp(object):
         self.plat_chips = {}
         self._plat_detail = {}
         self._prog_last = (0, 0)         # 最近一次进度事件（已完成 / 总数）
+        self._update_busy = False        # 正在检查 / 下载更新
+        self._update_info = None         # 待更新版本的元信息
+        self._update_pending = ""        # 已下载并通过校验的安装包路径
+        self._update_silent = True       # 本轮检查是否为「静默」（启动时那次）
+        self._restarting = False         # 正在退出以完成更新替换
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE + " v" + VERSION)
@@ -2835,6 +2864,7 @@ class JointApp(object):
                              % (now_text(), sentry_status()))
         self.root.after(80, self._drain)
         self.root.after(400, lambda: self.refresh_platform_status(silent=True))   # 启动后自动检测登录态
+        self.root.after(AUTO_UPDATE_DELAY_MS, lambda: self.on_check_update(silent=True))
         self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
 
     # ---------------- 错误上报 ----------------
@@ -2970,6 +3000,10 @@ class JointApp(object):
         self.btn_status = c.MButton(wrap, text="刷新登录态", kind="text", width=104, height=30,
                                     command=self.refresh_platform_status)
         self.btn_status.pack(side="left")
+        # 手动检查更新（启动后也会自动静默检查一次）
+        self.btn_update = c.MButton(wrap, text="检查更新", kind="text", width=96, height=30,
+                                    command=self.on_check_update)
+        self.btn_update.pack(side="left", padx=(8, 0))
 
     def _set_plat_chip(self, key, state, account="", expire=0, detail=""):
         """更新单个平台状态芯片（state: ok / invalid / missing / unknown / checking）"""
@@ -3044,6 +3078,240 @@ class JointApp(object):
                 results[key] = {"state": "unknown", "account": "", "expire": 0,
                                 "source": "", "detail": format_error(exc)}
         self._q.put(("status", results))
+
+    # ---------------- 自动更新 ----------------
+    # 全部流程：检查（静默/手动）→ 提示 → 后台下载（断点续传 + 加速镜像）
+    #           → SHA256 校验 → 生成替换脚本 → 退出并重启到新版本。
+    # 网络动作都在工作线程里做，界面只经 self._q 收消息，避免卡住主线程。
+    def on_check_update(self, silent=False):
+        """检查更新入口（按钮 command 会调用无参版本 → silent=False）"""
+        if update_check is None:
+            if not silent:
+                messagebox.showwarning(
+                    "检查更新不可用",
+                    "更新组件缺失或损坏（src/update_check.py）：%s" % _UPDATE_IMPORT_ERROR,
+                    parent=self.root)
+            return
+        if update_check.updates_disabled():
+            if not silent:
+                messagebox.showinfo("已关闭更新检查",
+                                    "已通过环境变量 %s 关闭更新检查。"
+                                    % update_check.ENV_DISABLE, parent=self.root)
+            return
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._update_silent = bool(silent)
+        self._update_info = None
+        try:
+            self.btn_update.set_enabled(False)
+            self.btn_update.set_text("检查中…")
+        except Exception:
+            pass
+        if not silent:
+            self._set_chip("检查更新中…", "busy")
+            self._append_log("%s  正在检查更新（当前 v%s）…" % (now_text(), CURRENT_VERSION))
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        try:
+            info = update_check.check_for_update(CURRENT_VERSION, notice=self._update_note)
+        except Exception as exc:
+            self._q.put(("update", ("check-error", format_error(exc))))
+            return
+        self._q.put(("update", ("check-done", info)))
+
+    def _update_note(self, text):
+        """更新模块的过程消息（工作线程调用 → 投递主线程写日志）"""
+        self._q.put(("log", "%s  [更新] %s" % (now_text(), text)))
+
+    def _on_update_event(self, kind, payload):
+        """主线程处理更新流程的各类事件"""
+        c = amis_query
+        if kind == "check-error":
+            self._update_busy = False
+            self._restore_update_button()
+            if self._update_silent:
+                self._append_log("%s  [更新] 检查更新失败（不影响使用）：%s"
+                                 % (now_text(), payload))
+                return
+            self._set_chip("就绪", "ok")
+            messagebox.showwarning("检查更新失败",
+                                   "没能连上版本服务器（可能是网络限制）：\n\n%s\n\n"
+                                   "程序可以照常使用；稍后再试，或设置环境变量\n"
+                                   "%s 指定可用的加速地址。" % (payload, update_check.ENV_MIRRORS),
+                                   parent=self.root)
+            return
+        if kind == "check-done":
+            self._update_busy = False
+            self._restore_update_button()
+            if not payload:
+                if self._update_silent:
+                    self._append_log("%s  [更新] 已是最新版本（v%s）"
+                                     % (now_text(), CURRENT_VERSION))
+                    return
+                self._set_chip("已是最新", "ok")
+                messagebox.showinfo("检查更新",
+                                    "已是最新版本（v%s）。" % CURRENT_VERSION, parent=self.root)
+                self.root.after(2500, lambda: self._set_chip("就绪", "ok"))
+                return
+            self._offer_update(payload)
+            return
+        if kind == "download-progress":
+            done, total = payload
+            try:
+                if total:
+                    self.progress.set_tone("normal")
+                    self.progress.set_value(min(1.0, done / float(total)))
+                    self.lbl_progress.configure(
+                        text="下载更新 %s / %s（%d%%）"
+                             % (update_check.human_size(done), update_check.human_size(total),
+                                int(done * 100.0 / total)), fg=c.CLR_PRIMARY)
+            except Exception:
+                pass
+            return
+        if kind == "download-done":
+            self._on_update_ready(payload)
+            return
+        if kind == "download-error":
+            self._update_busy = False
+            self._restore_update_button()
+            try:
+                self.progress.set_tone("warn")
+                self.progress.set_value(0)
+                self.lbl_progress.configure(text="更新下载失败", fg=c.CLR_WARNING)
+            except Exception:
+                pass
+            self._set_chip("更新失败 · 点击重试", "warn")
+            if self._update_info:
+                self._update_info = dict(self._update_info)
+            messagebox.showerror(
+                "下载更新失败",
+                "已下载的部分会保留，下次会从断点继续。\n\n%s" % payload, parent=self.root)
+            return
+
+    def _restore_update_button(self):
+        try:
+            self.btn_update.set_enabled(True)
+            self.btn_update.set_text("检查更新")
+        except Exception:
+            pass
+
+    def _offer_update(self, info):
+        """有新版本：状态芯片变色 + 可点击，并按需弹窗询问"""
+        self._update_info = info
+        text = "发现新版本 v%s · 点击更新" % info.get("version")
+        self._set_chip(text, "warn")
+        for widget in (self.chip_state, getattr(self.chip_state, "body", None),
+                       getattr(self.chip_state, "label", None)):
+            if widget is None:
+                continue
+            try:
+                widget.bind("<Button-1>", lambda _e: self._on_update_chip_click())
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
+        self._append_log("%s  [更新] 发现新版本 v%s（当前 v%s）· 来源 %s"
+                         % (now_text(), info.get("version"), CURRENT_VERSION,
+                            info.get("_source") or "?"))
+        if self._update_silent:
+            return
+        size = update_check.human_size(info.get("size"))
+        if messagebox.askyesno(
+                "发现新版本",
+                "有新版本 v%s 可用（当前 v%s）。\n\n"
+                "文件大小：%s\nSHA256：%s\n\n"
+                "现在下载并自动更新吗？（支持断点续传，下载完成后会自动重启程序）"
+                % (info.get("version"), CURRENT_VERSION, size,
+                   (info.get("sha256") or "")[:16] or "未提供"),
+                parent=self.root):
+            self._start_update_download(info)
+
+    def _on_update_chip_click(self):
+        if self._update_pending:
+            self._prompt_apply_update()
+        elif self._update_info:
+            self._start_update_download(self._update_info)
+        else:
+            self.on_check_update()
+
+    def _start_update_download(self, info):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._set_chip("正在下载 v%s…" % info.get("version"), "busy")
+        try:
+            self.btn_update.set_enabled(False)
+            self.btn_update.set_text("下载中…")
+            self.progress.set_tone("normal")
+            self.progress.set_value(0)
+            self.lbl_progress.configure(text="准备下载更新…", fg=amis_query.CLR_PRIMARY)
+        except Exception:
+            pass
+        threading.Thread(target=self._download_update_worker, args=(info,),
+                         daemon=True).start()
+
+    def _download_update_worker(self, info):
+        def prog(done, total, _speed):
+            self._q.put(("update", ("download-progress", (done, total))))
+        try:
+            path = update_check.download_update(info, progress=prog, notice=self._update_note)
+        except Exception as exc:
+            self._q.put(("update", ("download-error", format_error(exc))))
+            return
+        self._q.put(("update", ("download-done", path)))
+
+    def _on_update_ready(self, path):
+        self._update_busy = False
+        self._update_pending = path
+        self._restore_update_button()
+        try:
+            self.progress.set_tone("done")
+            self.progress.set_value(1.0)
+            self.lbl_progress.configure(text="更新包已下载并通过校验", fg=amis_query.CLR_SUCCESS)
+        except Exception:
+            pass
+        self._set_chip("更新包已就绪 · 点击安装", "warn")
+        self._append_log("%s  [更新] 安装包已就绪：%s" % (now_text(), path))
+        self._prompt_apply_update()
+
+    def _prompt_apply_update(self):
+        if not self._update_pending:
+            return
+        version = (self._update_info or {}).get("version") or "新"
+        if not messagebox.askyesno(
+                "安装更新",
+                "v%s 已下载完成并通过校验。\n\n现在退出程序、完成替换并自动重启吗？\n"
+                "（替换过程约 1~3 秒，若失败会自动打开旧版本）" % version,
+                parent=self.root):
+            self._append_log("%s  [更新] 已暂缓安装；稍后点右上角状态或「检查更新」即可继续"
+                             % now_text())
+            return
+        self._apply_update(self._update_pending)
+
+    def _apply_update(self, path):
+        try:
+            update_check.install_update(path, notice=self._update_note)
+        except Exception as exc:
+            detail = str(exc)
+            self._append_log("%s  [更新] 自动替换失败：%s" % (now_text(), detail))
+            if messagebox.askyesno(
+                    "自动替换失败",
+                    "%s\n\n是否打开安装包所在目录，手动替换？\n%s" % (detail, path),
+                    parent=self.root):
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception:
+                    pass
+            return
+        self._append_log("%s  [更新] 即将退出并完成替换，稍后会自动重新打开…" % now_text())
+        self._restarting = True
+        try:
+            self.progress.set_tone("done")
+            self.lbl_progress.configure(text="正在重启完成更新…", fg=amis_query.CLR_SUCCESS)
+        except Exception:
+            pass
+        self.root.after(400, self.root.destroy)
 
     def _on_platform_click(self, key):
         """点击状态芯片：打开对应平台的登录窗，换新凭据后自动刷新状态"""
@@ -3163,7 +3431,7 @@ class JointApp(object):
         self.lbl_status = tk.Label(inner, text="就绪", font=self.f_sub, bg=c.CLR_CARD,
                                    fg=c.CLR_SUB, anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True)
-        tail = "amis + ACE 联合查询 v%s" % VERSION
+        tail = "amis + ACE 联合查询 v%s" % CURRENT_VERSION
         if sentry_ready():
             tail += "　|　错误上报已启用（Sentry）"
         tk.Label(inner, text=tail, font=self.f_sub, bg=c.CLR_CARD,
@@ -3383,6 +3651,8 @@ class JointApp(object):
                     self._show_ace_detail(payload)
                 elif kind == "status":
                     self._apply_platform_status(payload)
+                elif kind == "update":
+                    self._on_update_event(*payload)
                 elif kind == "refresh_status":
                     self.refresh_platform_status(silent=True)
         except queue.Empty:
@@ -3722,7 +3992,8 @@ class JointApp(object):
             raise
         finally:
             mark("窗口关闭", category="app")
-            sentry_bridge.flush(3.0)         # 退出前把在途事件发完（最多等 3 秒）
+            if not self._restarting:         # 更新重启时尽快让出 exe，别让上报拖慢替换
+                sentry_bridge.flush(3.0)     # 退出前把在途事件发完（最多等 3 秒）
 
 # ==================================================================
 #                        统一 CSV 导出
@@ -3839,7 +4110,7 @@ def selfcheck():
         print("[%s] %s%s" % ("WARN", name, ("  " + extra) if extra else ""))
 
     print("=" * 68)
-    print("%s  v%s  自检（不联网）" % (APP_NAME, VERSION))
+    print("%s  v%s  自检（不联网）" % (APP_NAME, CURRENT_VERSION))
     print("=" * 68)
     print("脚本目录：%s" % SCRIPT_DIR)
     check("导入 amis_query", hasattr(amis_query, "run_query") and hasattr(amis_query, "summary_to_row"),
@@ -3935,6 +4206,28 @@ def selfcheck():
           and _t_deny.get("code") == "LICENSE_EXPIRED",
           "非 JSON 429（Cloudflare 边缘限流页）/ 5xx → 降级为「联不上」走离线容忍；"
           "LICENSE_* / KEY_* 等真实失效码原样上抛（仍按 fail_mode 静默退出）")
+
+    # ---- 自动更新：版本比较 / 加速地址拼接 / 断点续传 / 校验 / 替换脚本 ----
+    # 全部离线（断点续传用本地临时 HTTP 服务验证），不产生任何外网请求。
+    if update_check is None:
+        check("自动更新模块可用", False, "导入失败：%s" % _UPDATE_IMPORT_ERROR)
+    else:
+        _upd_ok, _upd_detail = update_check.offline_selftest(printer=print)
+        check("自动更新模块可用", _upd_ok, _upd_detail)
+        _upref = update_check.candidate_prefixes()
+        check("更新接入可用",
+              all(callable(getattr(update_check, n, None)) for n in
+                  ("check_for_update", "download_update", "install_update", "cmd_update"))
+              and all(hasattr(JointApp, n) for n in
+                      ("on_check_update", "_download_update_worker", "_on_update_event"))
+              and (("cmd_update" in _main_src) or not _main_src),
+              "当前版本 v%s（%s）；版本源 %d 条候选（直连 + %d 个加速镜像）；"
+              "GUI 按钮 / 菜单命令均已接入"
+              % (CURRENT_VERSION, "CI 构建版本" if BUILD_VERSION else "源码 VERSION",
+                 len(_upref), max(0, len(_upref) - 1)))
+        if update_check.updates_disabled():
+            warn("更新检查已关闭",
+                 "环境变量 %s 已置位，程序不会联网检查更新" % update_check.ENV_DISABLE)
     # ---- 错误上报（Sentry）：全部离线校验，不产生任何网络请求 ----
     _sc = sentry_bridge
     _dsn_cfg = _sc.parse_dsn(_sc.DEFAULT_DSN) if _sc else None
@@ -4174,24 +4467,80 @@ def test_sentry(verbose=True):
     return 0
 
 
+def cmd_update(install=True):
+    """命令行更新：检查 → 下载（断点续传）→ 校验 → 替换安装
+
+    退出码：0 = 已是最新（或更新流程已启动）；10 = 仅检查（--check-update）且有新版本；
+    1 = 检查 / 下载 / 安装失败。
+    """
+    if update_check is None:
+        print("更新组件缺失或损坏（src/update_check.py）：%s" % _UPDATE_IMPORT_ERROR)
+        return 1
+    if update_check.updates_disabled():
+        print("更新检查已关闭（环境变量 %s）" % update_check.ENV_DISABLE)
+        return 0
+    try:
+        info = update_check.check_for_update(CURRENT_VERSION, notice=print)
+    except Exception as exc:
+        print("检查更新失败：%s" % format_error(exc))
+        return 1
+    if not info:
+        return 0
+    print(update_check.format_info(info))
+    if not install:
+        return 10
+
+    last = [-1]
+
+    def prog(done, total, _speed):
+        if not total:
+            return
+        pct = int(done * 100.0 / total)
+        if pct % 5 == 0 and pct != last[0]:
+            last[0] = pct
+            print("  下载 %s / %s（%d%%）" % (update_check.human_size(done),
+                                            update_check.human_size(total), pct))
+
+    try:
+        path = update_check.download_update(info, progress=prog, notice=print)
+    except Exception as exc:
+        print("下载失败：%s" % format_error(exc))
+        print("（已下载的片段保留在 %s，下次会自动续传）" % update_check.updates_dir())
+        return 1
+    print("安装包已就绪：%s" % path)
+    try:
+        update_check.install_update(path, notice=print)
+    except Exception as exc:
+        print("%s" % exc)
+        return 1
+    print("替换脚本已启动：程序将退出并重启到 v%s。" % info.get("version"))
+    return 0
+
+
 def main(argv=None):
     ensure_console_output()
     parser = argparse.ArgumentParser(
-        prog="joint_query", description="%s v%s（单入口：amis + ACE）" % (APP_NAME, VERSION))
+        prog="joint_query", description="%s v%s（单入口：amis + ACE）" % (APP_NAME, CURRENT_VERSION))
     parser.add_argument("--selfcheck", action="store_true", help="离线自检（不联网）后退出")
     parser.add_argument("--version", action="store_true", help="显示版本后退出")
     parser.add_argument("--test-sentry", action="store_true",
                         help="向 Sentry 发一条测试事件，确认错误上报链路（联网）")
+    parser.add_argument("--check-update", action="store_true",
+                        help="检查有没有新版本（联网）后退出；退出码 0=最新，10=有新版本，1=失败")
+    parser.add_argument("--update", action="store_true",
+                        help="检查 → 断点续传下载 → 校验 → 替换安装（联网）后退出")
     args = parser.parse_args(argv)
 
     if args.version:
-        print("%s v%s%s" % (APP_NAME, VERSION,
-                            ("（build %s）" % BUILD_VERSION) if BUILD_VERSION else ""))
+        print("%s v%s%s" % (APP_NAME, CURRENT_VERSION,
+                            ("（源码 VERSION=%s）" % VERSION) if BUILD_VERSION else ""))
         return 0
     if args.selfcheck:
         return selfcheck()
     if args.test_sentry:
         return test_sentry()
+    if args.check_update or args.update:
+        return cmd_update(args.update)
 
     # 授权校验（license-guard）：放在一切业务代码之前 —— 校验不通过时进程在这里
     # 就按后端下发的策略结束（本工具由后端产品决定是静默退出还是提示后退出），

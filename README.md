@@ -24,6 +24,7 @@
 | **独立登录态** | amis 走 Token（本地缓存 → 浏览器 → 登录框），ACE 走 Cookie（凭据文件 → 自动登录）；哪边失效只弹哪边的登录框，换新后自动续跑本批 |
 | **统一导出** | 单个 CSV，含「编号识别 / amis 汇总 / amis 明细 / ACE 汇总 / ACE 明细」五段，写入程序目录的 `查询结果/` 子目录，文件名带时间戳 |
 | **授权保护** | 启动时经 [license-guard](https://github.com/Serein1202/license-guard) 校验授权码；服务端临时故障（限流、网关错误）会走离线容忍，不会把正常用户挡在门外 |
+| **自动更新** | 启动后自动比对 Release 版本，有新版本即**断点续传**下载（内置多个 GitHub 加速镜像，可按需覆盖）、校验 SHA256，再自动替换重启；也可点右上角「检查更新」手动触发 |
 | **错误上报** | 内置 Sentry 上报（已脱敏：长数字→`<id>`、密钥→`<redacted>`、用户名路径→`<user>`），可用环境变量关闭 |
 
 ## 下载即用（免装 Python）
@@ -33,6 +34,7 @@
 - 授权码已在构建时打进 exe，开箱即用
 - 文件校验和见同目录的 `AccountCheck.exe.sha256`
 - 每次推送到 `main` 都会自动重新打包并覆盖更新该 Release（下载链接固定不变）
+- **以后不用再来手动下载**：程序会自检更新（见下方「自动更新」一节）
 
 > 首次运行 Windows 可能提示"已保护你的电脑"（无代码签名证书的正常现象），点"更多信息 → 仍要运行"即可。
 
@@ -69,6 +71,7 @@ AccountCheck/
 │  ├─ amis_query.py        # amis 侧查询 + 共享的自绘 UI 组件（进度条 / 胶囊页签）
 │  ├─ ace_query.py         # ACE 侧查询引擎（登录 / 核查 / 数据查询 / 截图下载）
 │  ├─ license_boot.py      # 授权接入层（启动校验 + 运行期看门狗 + 服务地址/公钥）
+│  ├─ update_check.py      # 自动更新（版本比对 / 加速镜像竞速 / 断点续传 / 替换安装）
 │  └─ vendor/
 │     └─ license_guard.py  # license-guard 官方 SDK（零依赖）
 └─ docs/
@@ -103,6 +106,31 @@ AccountCheck/
 
 > ⚠️ 因为发布版 exe 内置了授权码，任何拿到 exe 的人都能使用（这正是"免配置下载即用"的代价）；如需严格按用户发放，应改为「发布不带内置码的 exe + 每个用户单独发码」。
 
+## 自动更新
+
+程序内置更新器（`src/update_check.py`，纯标准库），逻辑如下：
+
+| 环节 | 做法 |
+|---|---|
+| **检查** | 启动 6 秒后静默检查一次；也可点右上角「检查更新」手动检查。优先读 Release 里的 `latest.json`（几 KB，不受 GitHub API 60 次/小时限流影响），取不到再退回 GitHub REST API |
+| **加速** | 所有请求按「加速前缀 + 原始地址」拼多个候选源**并发竞速**，谁先答上就用谁（默认含 `gh-proxy.org`、`ghfast.top`、`ghproxy.net`、`gh.llkk.cc`、`hub.gitmirror.com`、`ghproxy.cc`）；下载前还会先探测各源首字节速度，挑最快的开下 |
+| **断点续传** | 数据写入 `%LOCALAPPDATA%\AccountCheck\updates\*.part`，用 HTTP `Range` 从已下字节继续；换镜像时核对总长度，对不上说明远端文件已换则重下；服务器不支持 Range（回 200）时自动整包重下。中断/关程序都不丢进度，下次接着下 |
+| **校验** | 下完比对文件大小与 SHA256（来自 `latest.json`，缺失则读 `AccountCheck.exe.sha256` 资产），只有校验通过才改名成正式安装包 |
+| **安装** | Windows 不允许覆盖正在运行的 exe，因此交给一个脱离本进程的外部程序完成：主方案是 `powershell -EncodedCommand`（脚本以 Base64/UTF-16LE 传入，中文 / 空格路径无需转义），失败退回临时 `.bat`。替换采用「同目录临时文件 + 原子替换」并自动重试，因此目标文件只会是完整的旧版或完整的新版，不会出现半截；成功后自动启动新版 |
+
+图形界面里：右上角状态变黄即表示「发现新版本」，点它就能下载；下载进度显示在底部进度条；装完会询问是否立即重启完成更新。
+
+命令行用法（适合脚本/排查）：
+
+```bash
+AccountCheck.exe --check-update    # 只检查；退出码 0=已最新，10=有新版本，1=失败
+AccountCheck.exe --update          # 检查 → 断点续传下载 → 校验 → 替换安装
+```
+
+自定义加速源（默认列表失效时很有用）：建一个 `%LOCALAPPDATA%\AccountCheck\mirrors.json`，内容形如
+`{"prefixes": ["https://你的加速前缀/"]}`；或设环境变量 `JOINT_UPDATE_MIRRORS`（逗号分隔，写 `none` 表示只用直连）。
+更新日志与下载片段都在 `%LOCALAPPDATA%\AccountCheck\`（`update.log` 可用来排查替换是否成功）。
+
 ## 自动化发布（CI/CD）
 
 `.github/workflows/build-release.yml`：**每次推送到 `main`（或手动触发）** 会自动完成
@@ -111,7 +139,7 @@ AccountCheck/
 2. 校验 Secret 是否就绪，把仓库 Secret **`APP_LICENSE_KEY`** 写入 `license.key`
 3. PyInstaller 打包成单文件 GUI exe（`--onefile --windowed`，内置授权码）
 4. **在打包产物里跑一次 `--selfcheck`**，退出码非 0 则中止发布（挡住"漏打模块 / 授权码没进包 / 冻结后路径写错"这类只在 exe 上暴露的问题）
-5. 生成 SHA256 校验和 → 上传 Artifact（存档 90 天）→ 以 `AccountCheck v1.0.N` 为名覆盖更新 `latest` Release
+5. 生成 SHA256 校验和与 **`latest.json`**（版本清单，供客户端自动更新比对）→ 上传 Artifact（存档 90 天）→ 以 `AccountCheck v1.0.N` 为名覆盖更新 `latest` Release
 
 ### 首次使用前必须配置 Secret
 
@@ -134,6 +162,8 @@ AccountCheck/
 | `JOINT_SENTRY=0` | 关闭 Sentry 上报 |
 | `JOINT_SENTRY_DSN` | 覆盖内置上报 DSN |
 | `AMIS_PROJECT_DIR` / `ACE_PROJECT_DIR` | 指定额外的登录态凭据回退目录（默认留空） |
+| `JOINT_UPDATE_MIRRORS` | 覆盖自动更新的加速前缀列表（逗号分隔；`none` = 只用直连） |
+| `JOINT_UPDATE_DISABLE` | 设为 `1` 关闭自动更新检查（程序完全不联网查版本） |
 
 ## 免责声明
 
