@@ -960,6 +960,9 @@ def build_installer_script(new_exe, target, log_file=""):
         lines.append("chcp 65001 >nul")
     lines += [
         "setlocal enableextensions",
+        # PyInstaller onefile：继承到的 _MEIPASS2 会让新 exe 跳过解包、
+        # 去用旧进程即将删除的 _MEI 目录，启动即报「Failed to load Python DLL」
+        'set "_MEIPASS2="',
         'set "NEW=%s"' % new_exe,
         'set "TGT=%s"' % target,
         'set "LOG=%s"' % log_file,
@@ -1015,6 +1018,9 @@ for ($i = 1; $i -le 120; $i++) {
 $msg = (Get-Date).ToString('s') + ' update ' + $(if ($ok) { 'ok' } else { 'FAILED' })
 try { Add-Content -LiteralPath $log -Value $msg -ErrorAction SilentlyContinue } catch {}
 if ($ok) { Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue }
+# PyInstaller onefile：继承到的 _MEIPASS2 会让新 exe 跳过解包、去用旧进程
+# 即将被删除的 _MEI 目录，报「Failed to load Python DLL」。必须剥掉再启动。
+try { Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue } catch {}
 Start-Process -FilePath $tgt
 """
 
@@ -1041,6 +1047,25 @@ def build_installer_command(new_exe, target, log_file=""):
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     return [powershell_path(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
             "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", encoded]
+
+
+def _clean_runtime_env():
+    """给「重启新版 exe」用的干净环境变量
+
+    PyInstaller onefile 的 bootloader 会在进程环境里设置 `_MEIPASS2`（指向
+    本进程的临时解包目录 _MEIxxxxx）。这个变量会随 subprocess 一路继承下去：
+    旧 exe → PowerShell/.bat → 新 exe。新 exe 的 bootloader 一旦看到
+    `_MEIPASS2` 已存在，就**跳过解包**、直接拿旧进程的 _MEI 目录当自己的
+    库目录 —— 而旧进程退出时会删掉那个目录，于是新 exe 报
+    「Failed to load Python DLL ...\\python3xx.dll，找不到指定的模块」。
+    这正是自动更新重启后必现弹窗的根因。这里把 PyInstaller 的进程内标记
+    全部剥掉，让新 exe 像正常双击启动一样重新解包。
+    """
+    env = dict(os.environ)
+    for key in ("_MEIPASS2", "_MEIPASS", "__PYVENV_LAUNCHER__",
+                "PYTHONHOME", "PYTHONPATH"):
+        env.pop(key, None)
+    return env
 
 
 def _detached_flags():
@@ -1099,7 +1124,8 @@ def launch_installer(new_exe, target=None, log_file="", notice=None):
             cmd = build_installer_command(new_exe, target, log_file)
             _log("install scheduled via powershell: %s -> %s" % (new_exe, target))
             before = _log_size(log_file)
-            subprocess.Popen(cmd, close_fds=True, creationflags=_detached_flags())
+            subprocess.Popen(cmd, close_fds=True, creationflags=_detached_flags(),
+                             env=_clean_runtime_env())
             if _wait_log_growth(log_file, before, 4.0):
                 if notice:
                     notice("替换程序已接管：程序退出后会自动覆盖并重启到新版本")
@@ -1116,7 +1142,8 @@ def launch_installer(new_exe, target=None, log_file="", notice=None):
     _log("install scheduled via bat: %s -> %s (script %s)" % (new_exe, target, script))
     before = _log_size(log_file)
     subprocess.Popen(["cmd", "/c", script], close_fds=True,
-                     creationflags=_detached_flags(), cwd=os.path.dirname(script))
+                     creationflags=_detached_flags(), cwd=os.path.dirname(script),
+                     env=_clean_runtime_env())
     if not _wait_log_growth(log_file, before, 4.0):
         raise UpdateError(
             "替换程序无法启动（PowerShell 与 .bat 都没跑起来），"
@@ -1181,10 +1208,22 @@ def offline_selftest(printer=None):
                                      os.path.join(tempfile.gettempdir(), target_name),
                                      os.path.join(tempfile.gettempdir(), "更新 日志.log"))
         decoded = base64.b64decode(cmd[-1]).decode("utf-16-le")
+        # 自重启必须剥掉 PyInstaller 的 _MEIPASS2，否则新 exe 跳过解包、
+        # 去加载旧进程退出即删除的 _MEI 目录里的 python DLL，启动即弹窗。
+        # 源码运行时环境里本没有这些变量，先注入再验证 _clean_runtime_env 生效。
+        os.environ["_MEIPASS2"] = r"C:\fake\_MEItest"
+        os.environ["_MEIPASS"] = os.environ["_MEIPASS2"]
+        try:
+            clean = _clean_runtime_env()
+            env_ok = not {"_MEIPASS2", "_MEIPASS"} & set(clean)
+        finally:
+            os.environ.pop("_MEIPASS2", None)
+            os.environ.pop("_MEIPASS", None)
         need("替换命令生成",
              "powershell" in cmd[0].lower() and "Copy-Item" in decoded
              and "Move-Item" in decoded and target_name in decoded
-             and "Start-Process" in decoded)
+             and "Start-Process" in decoded
+             and "_MEIPASS2" in decoded and env_ok)
     except Exception as exc:                            # noqa: BLE001
         need("替换命令生成", False, _short(exc))
 
@@ -1194,7 +1233,8 @@ def offline_selftest(printer=None):
         with open(script, "rb") as f:
             body = f.read().decode("utf-8-sig", "replace")
         need("替换脚本兜底生成",
-             'copy /Y' in body and "tgt.exe" in body and "@echo off" in body)
+             'copy /Y' in body and "tgt.exe" in body and "@echo off" in body
+             and '_MEIPASS2=' in body)
         try:
             shutil.rmtree(os.path.dirname(script), ignore_errors=True)
         except Exception:
