@@ -2830,6 +2830,8 @@ class JointApp(object):
         self._ace_login_win = None
         self._status_busy = False
         self._status_refresh_pending = False   # 忙碌期间收到了新的刷新请求（结束后补一轮）
+        self._status_gen = 0                   # 轮次代号：旧轮次的迟到结果不许覆盖新状态
+        self._plat_state = {}                  # key -> (state, monotonic)；用于抑制重复刷新时的芯片闪烁
         self.plat_chips = {}
         self._plat_detail = {}
         self._prog_last = (0, 0)         # 最近一次进度事件（已完成 / 总数）
@@ -3018,6 +3020,9 @@ class JointApp(object):
         chip = self.plat_chips.get(key)
         if chip is None:
             return
+        # 记下该芯片最近一次进入某状态的时刻：自动刷新频繁重启时，
+        # 靠它判断「这个状态还新不新鲜」，避免反复闪「检测中」（见 refresh_platform_status）
+        self._plat_state[key] = (state, time.monotonic())
         title = PLATFORM_LABEL.get(key, key)
         palette = {"ok": (c.CLR_SUCCESS_CONTAINER, c.CLR_SUCCESS),
                    "invalid": (c.CLR_ERROR_CONTAINER, c.CLR_ERROR),
@@ -3047,6 +3052,9 @@ class JointApp(object):
 
     def _apply_platform_status(self, results):
         """应用状态探测结果（results 可只含某一个平台；_full 表示整轮探测结束）"""
+        gen = results.get("_gen")
+        if gen is not None and gen != self._status_gen:
+            return          # 旧轮次的迟到结果：直接丢弃，防止覆盖新一轮的芯片状态
         if results.get("_full"):
             self._status_busy = False
             if self._status_refresh_pending:
@@ -3077,42 +3085,64 @@ class JointApp(object):
                                  % now_text())
             return
         self._status_busy = True
+        self._status_gen += 1
+        gen = self._status_gen
+        now = time.monotonic()
         for key in (PLATFORM_AMIS, PLATFORM_ACE):
+            st = self._plat_state.get(key)
+            # 手动刷新把芯片置「检测中」当反馈；自动刷新（查询结束 / 登录复核 / 补刷）
+            # 若该芯片 30 秒内刚出过结果，则保留原状态——否则每次自动轮都会闪一下蓝
+            if silent and st and st[0] != "checking" and now - st[1] < 30:
+                continue
             self._set_plat_chip(key, "checking")
         if not silent:
             self._append_log("%s  正在检测两个平台的登录态…" % now_text())
-        threading.Thread(target=self._status_worker, daemon=True).start()
+        threading.Thread(target=self._status_worker, args=(gen,), daemon=True).start()
 
-    def _status_worker(self):
+    def _status_worker(self, gen):
         """两个平台并发探测、互不等待：谁先出结果谁先刷新芯片
 
         原实现是串行（amis 探完才探 ACE），网络不佳时单平台 30s 超时会让
         两个芯片一起「检测中」长达一分钟；现在各开一个线程，单平台的慢
         不再拖累另一个，最坏等待也从 2×超时 降到 1×超时。
+
+        另加看门狗：urlopen 的 timeout 管不住 DNS 解析（getaddrinfo 可能
+        卡几十秒），线程一旦无限挂起，`_full` 永远不会入队，`_status_busy`
+        卡死、芯片永远「检测中」。这里对每个平台限时兜底，保证任何一轮
+        都能在 PROBE_TIMEOUT + 余量内收敛出结果。
         """
         platforms = (PLATFORM_AMIS, PLATFORM_ACE)
         left = {"n": len(platforms)}
         lock = threading.Lock()
 
         def run_one(key):
-            try:
+            box = {}
+
+            def work():
                 try:
-                    res = probe_platform_status(key, timeout=PROBE_TIMEOUT)
+                    box["res"] = probe_platform_status(key, timeout=PROBE_TIMEOUT)
                 except Exception as exc:
                     # 登录态探测受网络影响大（未登录 / 断网都算预期），只记面包屑不报事件
-                    mark("登录态探测异常（%s）：%s" % (key, format_error(exc)),
-                         category="status", level="warning")
-                    res = {"state": "unknown", "account": "", "expire": 0,
-                           "source": "", "detail": format_error(exc)}
-            except Exception:                     # 兜底：绝不能让 busy 标志卡死
-                res = {"state": "unknown", "account": "", "expire": 0, "source": "",
-                       "detail": "探测线程异常（已忽略）"}
+                    try:
+                        mark("登录态探测异常（%s）：%s" % (key, format_error(exc)),
+                             category="status", level="warning")
+                    except Exception:
+                        pass
+                    box["res"] = {"state": "unknown", "account": "", "expire": 0,
+                                  "source": "", "detail": format_error(exc)}
+
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            t.join(PROBE_TIMEOUT + 8)
+            res = box.get("res") or {
+                "state": "unknown", "account": "", "expire": 0, "source": "",
+                "detail": "检测超时：网络长时间无响应（本地凭据未改动，可稍后重试）"}
             # put 必须在锁内：保证最后一个完成的事件带着 _full=True 最后入队，
             # 否则 _status_busy 可能永远释放不了
             with lock:
                 left["n"] -= 1
                 last = left["n"] <= 0
-                self._q.put(("status", {"_full": last, key: res}))
+                self._q.put(("status", {"_full": last, "_gen": gen, key: res}))
 
         for key in platforms:
             threading.Thread(target=run_one, args=(key,), daemon=True).start()
@@ -3673,26 +3703,34 @@ class JointApp(object):
         try:
             while True:
                 kind, payload = self._q.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "progress":
-                    self._progress_update(*payload)
-                elif kind == "done":
-                    self._on_done(payload)
-                elif kind == "error":
-                    self._on_error(payload)
-                elif kind == "ask_login":
-                    self._show_login(payload)
-                elif kind == "ask_ace_login":
-                    self._show_ace_login(payload)
-                elif kind == "ace_detail":
-                    self._show_ace_detail(payload)
-                elif kind == "status":
-                    self._apply_platform_status(payload)
-                elif kind == "update":
-                    self._on_update_event(*payload)
-                elif kind == "refresh_status":
-                    self.refresh_platform_status(silent=True)
+                try:
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "progress":
+                        self._progress_update(*payload)
+                    elif kind == "done":
+                        self._on_done(payload)
+                    elif kind == "error":
+                        self._on_error(payload)
+                    elif kind == "ask_login":
+                        self._show_login(payload)
+                    elif kind == "ask_ace_login":
+                        self._show_ace_login(payload)
+                    elif kind == "ace_detail":
+                        self._show_ace_detail(payload)
+                    elif kind == "status":
+                        self._apply_platform_status(payload)
+                    elif kind == "update":
+                        self._on_update_event(*payload)
+                    elif kind == "refresh_status":
+                        self.refresh_platform_status(silent=True)
+                except Exception as exc:
+                    # 单条事件处理失败绝不能拖垮事件泵：否则 after(80) 轮询链断裂，
+                    # 界面从此不再更新（芯片会永远停在「检测中」这类中间状态）
+                    try:
+                        report_exception(exc, tags={"stage": "ui-drain", "event": str(kind)})
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         self.root.after(80, self._drain)
