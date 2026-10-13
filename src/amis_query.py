@@ -971,7 +971,7 @@ def fetch_records_with_auth_retry(role_id, box, key_type, note):
 
 
 # ---------------------------------------------------------------- 角色信息（角色名补齐）
-def _request_user_info(role_id, token, account, key_type=KEY_TYPE_ROLE):
+def _request_user_info(role_id, token, account, key_type=KEY_TYPE_ROLE, timeout=None):
     """按角色ID / 无端ID 取角色信息（角色名 / 已登记无端ID / 角色ID）
 
     返回 {"role_name": 展示用角色名, "wd_id": 无端ID, "role_id": 角色ID,
@@ -999,7 +999,7 @@ def _request_user_info(role_id, token, account, key_type=KEY_TYPE_ROLE):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):

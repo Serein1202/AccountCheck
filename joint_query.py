@@ -156,6 +156,8 @@ PLATFORM_LABEL = {PLATFORM_AMIS: "amis", PLATFORM_ACE: "ACE"}
 # 登录态探测：仅用于轻量只读请求，不会产生业务数据
 ACE_PROBE_OPENID = "0"
 AMIS_PROBE_KEYWORD = "99999999999999"
+PROBE_TIMEOUT = 12               # 探测请求的超时（秒）：比业务请求短得多——
+                                 # 探测只需要「通 / 不通」的结论，卡 30s 只会让芯片一直「检测中」
 
 # 单个编号在联合查询里的参与情况
 IDENT_COLUMNS = ("idx", "raw", "kinds", "platforms", "note")
@@ -1116,13 +1118,14 @@ def ace_local_snapshot():
             "expire": _ace_expire_ts(data), "source": os.path.basename(path), "detail": ""}
 
 
-def probe_amis_online(token, account=""):
+def probe_amis_online(token, account="", timeout=None):
     """在线轻量校验 amis Token：valid / invalid / unknown（只读查询，无副作用）"""
     if not token:
         return "missing"
     try:
         amis_query._request_user_info(AMIS_PROBE_KEYWORD, token, account or "",
-                                      amis_query.KEY_TYPE_ROLE)
+                                      amis_query.KEY_TYPE_ROLE,
+                                      timeout=timeout or PROBE_TIMEOUT)
         return "valid"
     except amis_query.TokenInvalidError:
         return "invalid"
@@ -1130,13 +1133,15 @@ def probe_amis_online(token, account=""):
         return "unknown"
 
 
-def probe_ace_online(cookies):
+def probe_ace_online(cookies, timeout=None):
     """在线轻量校验 ACE 登录态：valid / invalid / unknown（查询一个不存在的 OpenID）"""
     if not cookies:
         return "missing"
+    timeout = timeout or PROBE_TIMEOUT
     try:
         begin, end = ace_query.dq_time_range()
-        ace_query.query_punish(ACE_PROBE_OPENID, 1, 1, cookies, begin, end)
+        ace_query.query_punish(ACE_PROBE_OPENID, 1, 1, cookies, begin, end,
+                               timeout=timeout)
         return "valid"
     except Exception as exc:
         if isinstance(exc, getattr(ace_query, "LoginManualRequired", ())):
@@ -1146,7 +1151,7 @@ def probe_ace_online(cookies):
         return "unknown"
 
 
-def probe_platform_status(platform):
+def probe_platform_status(platform, timeout=None):
     """完整探测某平台登录态，返回 dict(state, account, expire, source, detail)
 
     判定顺序：本地凭据 → 在线轻量校验；只有服务端明确判定失效才算 invalid，
@@ -1159,7 +1164,8 @@ def probe_platform_status(platform):
         if snap["state"] == "missing":
             return {"state": "missing", "account": "", "expire": 0, "source": "",
                     "detail": "本机未找到 amis Token（环境变量 / 本地缓存 / 浏览器均无）"}
-        verdict = probe_amis_online(snap.get("token"), snap.get("account"))
+        verdict = probe_amis_online(snap.get("token"), snap.get("account"),
+                                    timeout=timeout)
         worth = ("，本地记录到期时间 %s" % fmt_expire_text(expire)) if expire else ""
         if verdict == "valid":
             return {"state": "ok", "account": snap.get("account") or "", "expire": expire,
@@ -1181,7 +1187,7 @@ def probe_platform_status(platform):
         detail = snap.get("detail") or "未找到 ACE 凭据文件"
         return {"state": "missing", "account": snap.get("account") or "", "expire": 0,
                 "source": snap.get("source") or "", "detail": detail}
-    verdict = probe_ace_online(snap.get("cookies"))
+    verdict = probe_ace_online(snap.get("cookies"), timeout=timeout)
     account = snap.get("account") or ""
     worth = ("；本地记录 Cookie 到期时间 %s" % fmt_expire_text(expire)) if expire else ""
     if verdict == "valid":
@@ -2823,6 +2829,7 @@ class JointApp(object):
         self._login_win = None
         self._ace_login_win = None
         self._status_busy = False
+        self._status_refresh_pending = False   # 忙碌期间收到了新的刷新请求（结束后补一轮）
         self.plat_chips = {}
         self._plat_detail = {}
         self._prog_last = (0, 0)         # 最近一次进度事件（已完成 / 总数）
@@ -3042,6 +3049,10 @@ class JointApp(object):
         """应用状态探测结果（results 可只含某一个平台；_full 表示整轮探测结束）"""
         if results.get("_full"):
             self._status_busy = False
+            if self._status_refresh_pending:
+                # 忙碌期间有新的刷新请求（典型：登录成功后想立刻确认新凭据）→ 补一轮
+                self._status_refresh_pending = False
+                self.root.after(300, lambda: self.refresh_platform_status(silent=True))
         parts = []
         for key in (PLATFORM_AMIS, PLATFORM_ACE):
             if key not in results:
@@ -3058,6 +3069,12 @@ class JointApp(object):
     def refresh_platform_status(self, silent=False):
         """后台检测两个平台的登录态（在线轻量校验，只读）"""
         if self._status_busy:
+            # 上一轮还没跑完（如刚开机网络慢、探测还在超时里）：不能把「补一轮」
+            # 静默吞掉，否则登录成功后芯片会一直停在「检测中」，只能靠用户再点一次
+            self._status_refresh_pending = True
+            if not silent:
+                self._append_log("%s  上一轮登录态检测还在进行，结束后会自动再检测一次…"
+                                 % now_text())
             return
         self._status_busy = True
         for key in (PLATFORM_AMIS, PLATFORM_ACE):
@@ -3067,17 +3084,38 @@ class JointApp(object):
         threading.Thread(target=self._status_worker, daemon=True).start()
 
     def _status_worker(self):
-        results = {"_full": True}
-        for key in (PLATFORM_AMIS, PLATFORM_ACE):
+        """两个平台并发探测、互不等待：谁先出结果谁先刷新芯片
+
+        原实现是串行（amis 探完才探 ACE），网络不佳时单平台 30s 超时会让
+        两个芯片一起「检测中」长达一分钟；现在各开一个线程，单平台的慢
+        不再拖累另一个，最坏等待也从 2×超时 降到 1×超时。
+        """
+        platforms = (PLATFORM_AMIS, PLATFORM_ACE)
+        left = {"n": len(platforms)}
+        lock = threading.Lock()
+
+        def run_one(key):
             try:
-                results[key] = probe_platform_status(key)
-            except Exception as exc:
-                # 登录态探测受网络影响大（未登录 / 断网都算预期），只记面包屑不报事件
-                mark("登录态探测异常（%s）：%s" % (key, format_error(exc)),
-                     category="status", level="warning")
-                results[key] = {"state": "unknown", "account": "", "expire": 0,
-                                "source": "", "detail": format_error(exc)}
-        self._q.put(("status", results))
+                try:
+                    res = probe_platform_status(key, timeout=PROBE_TIMEOUT)
+                except Exception as exc:
+                    # 登录态探测受网络影响大（未登录 / 断网都算预期），只记面包屑不报事件
+                    mark("登录态探测异常（%s）：%s" % (key, format_error(exc)),
+                         category="status", level="warning")
+                    res = {"state": "unknown", "account": "", "expire": 0,
+                           "source": "", "detail": format_error(exc)}
+            except Exception:                     # 兜底：绝不能让 busy 标志卡死
+                res = {"state": "unknown", "account": "", "expire": 0, "source": "",
+                       "detail": "探测线程异常（已忽略）"}
+            # put 必须在锁内：保证最后一个完成的事件带着 _full=True 最后入队，
+            # 否则 _status_busy 可能永远释放不了
+            with lock:
+                left["n"] -= 1
+                last = left["n"] <= 0
+                self._q.put(("status", {"_full": last, key: res}))
+
+        for key in platforms:
+            threading.Thread(target=run_one, args=(key,), daemon=True).start()
 
     # ---------------- 自动更新 ----------------
     # 全部流程：检查（静默/手动）→ 提示 → 后台下载（断点续传 + 加速镜像）
@@ -3678,6 +3716,9 @@ class JointApp(object):
         finally:
             if req.get("res"):
                 self._set_plat_chip(PLATFORM_AMIS, "checking", detail="登录成功，正在更新本地 Token…")
+                # 登录成功后立刻复核一次登录态。查询预检路径（首次使用）此前没有任何
+                # 刷新调度，芯片会一直「检测中」直到整轮查询结束——看起来就像卡死了
+                self._q.put(("refresh_status", None))
             req["event"].set()
 
     def _ask_ace_login_threadsafe(self, reason=""):
@@ -3697,6 +3738,8 @@ class JointApp(object):
             if req.get("res"):
                 self._set_plat_chip(PLATFORM_ACE, "checking",
                                     detail="登录成功，正在更新本地凭据并续跑查询…")
+                # 同 amis：登录成功立刻复核，不等整轮查询结束
+                self._q.put(("refresh_status", None))
             req["event"].set()
 
     # ---------------- 结果区 ----------------

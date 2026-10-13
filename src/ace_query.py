@@ -697,7 +697,7 @@ def write_credentials(cookies, account=None, note=None, backup=True):
     return CREDENTIALS_FILE
 
 
-def _post_json(url, payload, trace_header, cookies):
+def _post_json(url, payload, trace_header, cookies, timeout=30):
     """向 ACE 接口 POST JSON 并返回解析后的 dict；网络 / 登录态异常统一转为 AceError。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -714,7 +714,7 @@ def _post_json(url, payload, trace_header, cookies):
     request = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
             status = response.status
     except urllib.error.HTTPError as exc:
@@ -834,7 +834,8 @@ def dq_time_range():
     return resolve_dq_dates(None, None)
 
 
-def query_punish(openid, page, page_size, cookies, begin_time=None, end_time=None):
+def query_punish(openid, page, page_size, cookies, begin_time=None, end_time=None,
+                 timeout=None):
     """调用「数据查询」接口，返回 (总条数 count, 处罚记录列表 punish_list)。失败抛 AceError。"""
     query_string = "&".join("%s=%s" % (k, v) for k, v in DQ_QUERY_PARAMS.items())
     url = DQ_URL + "?" + query_string
@@ -853,7 +854,7 @@ def query_punish(openid, page, page_size, cookies, begin_time=None, end_time=Non
         "page_size": page_size,
     }
 
-    data = _post_json(url, payload, DQ_TRACE_HEADER, cookies)
+    data = _post_json(url, payload, DQ_TRACE_HEADER, cookies, timeout=timeout or 30)
     info = data.get("info") or {}
 
     try:
