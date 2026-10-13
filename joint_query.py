@@ -4066,16 +4066,54 @@ def export_joint_csv(res, out_dir=None):
 # ==================================================================
 #                        自检 / 入口
 # ==================================================================
+def _reopen_stdio_from_handles():
+    """把父进程继承来的标准句柄接回 sys.stdout / sys.stderr
+
+    ``--windowed`` 的 exe 启动时没有控制台，C 运行库不会初始化标准流
+    （``sys.stdout`` 为 None）；但如果父进程做了重定向，例如
+
+        cmd /c "AccountCheck.exe --selfcheck > out.txt"
+
+    句柄其实是有效的，只是没人去接它。这里用 GetStdHandle 把它取回来，
+    让 ``--selfcheck`` / ``--version`` / ``--check-update`` / ``--update``
+    的输出能真正落进文件或管道（排查问题时很关键）。
+    """
+    try:
+        import ctypes
+        import msvcrt
+        k32 = ctypes.windll.kernel32
+    except Exception:
+        return {}
+    made = {}
+    for name, code in (("stdout", -11), ("stderr", -12)):      # STD_OUTPUT/ERROR_HANDLE
+        if getattr(sys, name, None) is not None:
+            continue
+        handle = k32.GetStdHandle(code)
+        if not handle or handle in (0, -1):
+            continue
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY)
+            made[name] = os.fdopen(fd, "w", errors="replace", buffering=1)
+        except Exception:
+            continue
+    return made
+
+
 def ensure_console_output():
-    """保证 print() 永远不炸。
+    """保证 print() 永远不炸，且尽量让输出真正可见。
 
     打包成 GUI 子系统 exe（``--windowed``）后进程没有控制台，``sys.stdout`` / ``sys.stderr``
-    会是 None —— 这时任何 ``print()`` 都会抛异常把程序打死。所以：
-      1) 在 cmd / PowerShell 里运行时，附着到父进程控制台，让 ``--selfcheck``、
-         ``--version``、``--cli`` 的输出正常显示；
-      2) 双击启动（没有父控制台）时把输出丢进空设备，静默丢弃即可。
+    会是 None —— 这时任何 ``print()`` 都会抛异常把程序打死。所以按顺序尝试：
+      1) 父进程已重定向（``> out.txt``）或已连着终端：把继承来的句柄接回来；
+      2) 在 cmd / PowerShell 里运行：附着到父进程控制台；
+      3) 双击启动（既无控制台也无重定向）：输出丢进空设备，静默丢弃即可。
     """
     if sys.stdout is not None and sys.stderr is not None:
+        return
+    made = _reopen_stdio_from_handles()
+    if made.get("stdout") or made.get("stderr"):
+        sys.stdout = made.get("stdout") or made.get("stderr")
+        sys.stderr = made.get("stderr") or made.get("stdout")
         return
     try:
         import ctypes
