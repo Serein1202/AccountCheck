@@ -11,18 +11,18 @@
 
 ================ 组成与约定 ================
 
-· SDK 在 ``src/vendor/license_guard.py``（零第三方依赖），接入常量在 ``license_config.py``。
+· SDK 在 ``src/vendor/license_guard.py``（零第三方依赖）；服务地址 / app_id / 公钥等
+  接入常量直接写在本文件顶部（原 ``license_config.py`` 已并入）。
 · 策略（fail_mode / exit_code / offline_grace_days / heartbeat_sec）由**后端下发并覆盖**
   本地兜底值；本地那些只用于「连不上后端」的场景。客户端不写死策略。
 · 授权码（license key）查找顺序：
       1. 环境变量 ``LICENSE_KEY`` / ``{APP_ID}_LICENSE_KEY`` / ``APP_LICENSE_KEY``
       2. 程序目录 ``license.key``（打包成 exe 时为 exe 所在目录）
       3. 程序目录 ``.license``
-      4. 程序目录 ``vendor/license.key``
-      5. **打包内置** ``license.key``（PyInstaller 单文件模式的 ``sys._MEIPASS``；
+      4. **打包内置** ``license.key``（PyInstaller 单文件模式的 ``sys._MEIPASS``；
          由 CI 从 ``secrets.APP_LICENSE_KEY`` 注入后 ``--add-data`` 塞进 exe）
-      6. ``%LOCALAPPDATA%\\{APP_ID}\\license.key``
-· **组件缺失时拒绝启动（fail-closed）**：删掉 ``vendor/`` 或 ``license_config.py``
+      5. ``%LOCALAPPDATA%\\{APP_ID}\\license.key``
+· **组件缺失时拒绝启动（fail-closed）**：删掉 SDK（``src/vendor/license_guard.py``）
   不能绕过校验，程序会直接退出并给出提示。
 · 授权失效时的表现（闪退 / 提示后退出、退出码）完全由后端产品的 ``fail_mode`` 决定。
 """
@@ -38,11 +38,21 @@ _VENDOR = _HERE / "vendor"
 if str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
-# ---- 加载 SDK 与配置常量（失败则 fail-closed，不让程序继续跑）----
+# ---- 接入常量（原独立文件 license_config.py，已并入本文件）----
+SERVER_URL = "https://license-guard.xhd19981202.workers.dev"
+APP_ID = "748291635"
+SIGN_ALG = "ed25519"
+
+# ed25519 用 raw base64url 公钥
+PUBLIC_KEY = "LjZLPnhcuJ5qJEtNi1axHbc54lvk-wfN5wcCTfZzIEk"
+
+# 兜底策略：后端连不上时才生效，正常情况下后端会下发并覆盖它
+FAIL_MODE = "hard"          # "hard" 静默退出 / "message" 提示后退出
+EXIT_CODE = 0
+
+# ---- 加载 SDK（失败则 fail-closed，不让程序继续跑）----
 _IMPORT_ERROR = None
 try:
-    from license_config import (APP_ID, EXIT_CODE, FAIL_MODE, PUBLIC_KEY,
-                               SERVER_URL, SIGN_ALG)
     from license_guard import GuardConfig, LicenseError, LicenseGuard, machine_id
 except Exception as _exc:                      # pragma: no cover - 仅组件缺失时发生
     _IMPORT_ERROR = _exc
@@ -79,7 +89,7 @@ def app_dir():
 def license_key_candidates():
     """授权码文件的候选路径（按优先级）"""
     base = app_dir()
-    out = [base / "license.key", base / ".license", base / "vendor" / "license.key"]
+    out = [base / "license.key", base / ".license"]
     # 打包时随 exe 一起塞进去的授权码（PyInstaller 单文件模式会解包到 sys._MEIPASS）。
     # 放在「exe 同目录」之后：用户若在 exe 旁边放了自己的 license.key，以用户那份为准。
     bundle = getattr(sys, "_MEIPASS", "")
@@ -165,8 +175,8 @@ def ensure_license(component=""):
     """
     global _GUARD
     if _IMPORT_ERROR is not None:
-        _fatal("授权组件缺失或损坏（%s）。请确认 vendor/license_guard.py 与 "
-               "license_config.py 与本程序在同一目录下。" % load_error())
+        _fatal("授权组件缺失或损坏（%s）。请确认 SDK 位于 src/vendor/license_guard.py，"
+               "且本文件（license_boot.py）完整。" % load_error())
 
     guard = LicenseGuard(GuardConfig(
         server_url=SERVER_URL,

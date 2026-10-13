@@ -64,20 +64,18 @@ python joint_query.py --version
 AccountCheck/
 ├─ .github/workflows/
 │  └─ build-release.yml    # CI：push 到 main → 打包单文件 exe → 自检 → 发布 Releases
-├─ joint_query.py          # 主入口：统一 GUI + 联合查询编排（同时查 amis 与 ACE）
+├─ joint_query.py          # 唯一的代码入口：GUI + 联合查询编排 + 错误上报（Sentry）
 ├─ src/                    # 库模块
 │  ├─ amis_query.py        # amis 侧查询 + 共享的自绘 UI 组件（进度条 / 胶囊页签）
-│  ├─ ace_query.py         # ACE 侧查询（含独立 GUI 与 --cli 文本模式）
-│  ├─ sentry_bridge.py     # 错误上报（纯标准库直连 Sentry，异步 + 脱敏）
-│  ├─ license_boot.py      # 授权接入层（启动校验 + 运行期看门狗）
-│  ├─ license_config.py    # 授权服务地址 / app_id / 公钥
+│  ├─ ace_query.py         # ACE 侧查询引擎（登录 / 核查 / 数据查询 / 截图下载）
+│  ├─ license_boot.py      # 授权接入层（启动校验 + 运行期看门狗 + 服务地址/公钥）
 │  └─ vendor/
 │     └─ license_guard.py  # license-guard 官方 SDK（零依赖）
 └─ docs/
    └─ screenshot.png       # 界面截图
 ```
 
-`ace_query.py` 也能单独运行（例如 `python src/ace_query.py --cli 12376323`），方便只用其中一侧时调试。
+程序只有一个入口 `joint_query.py`：amis / ACE / 授权 / 上报都已收在它和 `src/` 里，直接 `pythonw joint_query.py` 即可。
 
 ## 使用说明
 
