@@ -2911,6 +2911,9 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
     - 选中若干行后 Ctrl+C：复制选中行；既无选区也无选中行时复制全部
     - 右键菜单：复制该单元格 / 复制图片（截图格）/ 复制选中区域 /
       复制选中行（含表头）/ 复制全部
+    - 双击单元格（或右键「选取该单元格文字」）：在该格上叠一个文本框并
+      全选内容，可自由选择其中一部分再 Ctrl+C（复制后自动收起；
+      点击别处 / Esc / 滚动也能关闭），适合「只要无端ID前几位」这类场景
     内容为制表符分隔的纯文本，粘到表格类软件可自动分列。
     row_provider(iid) 自定义一行的取值；image_provider(iid, idx, fetch)
     返回图片字节时该格按图片复制（fetch=False 只查缓存，不触发下载）。
@@ -3022,6 +3025,7 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
         set_range(drag["r0"], ri, drag["c0"], ci)
 
     def on_press(event):
+        close_overlay()                     # 点击别处先收起文字浮层
         tree._copy_drag_moved = False
         if getattr(tree, "_cell_range", None):
             clear_range()
@@ -3082,6 +3086,90 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
     hl.bind_motion(on_border_motion)
     tree._copy_highlight = hl               # 防被回收
 
+    # ---- 单元格文字选取浮层：双击后叠一个 Entry，可自由选部分文字复制 ----
+    box = {"entry": None}
+
+    def close_overlay(_e=None):
+        ent = box["entry"]
+        if ent is not None:
+            box["entry"] = None
+            try:
+                ent.destroy()
+            except Exception:
+                pass
+
+    def _is_image_cell(iid, ci):
+        if not image_provider or ci < 0:
+            return False
+        try:
+            return bool(image_provider(iid, ci, False))
+        except Exception:
+            return False
+
+    def open_overlay_at(iid, col):
+        """在 (iid, col) 上叠文本框；成功返回 True。图片格 / 空格 / 格不可见时放弃"""
+        close_overlay()
+        if not iid or not col:
+            return False
+        ci = col_id_index(col)
+        if ci < 0 or _is_image_cell(iid, ci):
+            return False
+        val = column_value(tree, iid, ci, row_provider)
+        if not val:
+            return False
+        try:
+            bb = tree.bbox(iid, col)
+        except Exception:
+            bb = ""
+        if not bb:
+            return False
+        bx, by, bw, bh = bb
+        try:    # 字体跟随表格样式（各表字号不同），取不到再用界面默认
+            fnt = ttk.Style().lookup(str(tree["style"] or "Treeview"), "font") \
+                  or (FONT_UI, 10)
+        except Exception:
+            fnt = (FONT_UI, 10)
+        ent = tk.Entry(tree, justify="center",
+                       font=fnt,
+                       relief="flat", bd=0,
+                       highlightthickness=1, highlightbackground=CLR_PRIMARY,
+                       highlightcolor=CLR_PRIMARY,
+                       background=CLR_CARD, foreground=CLR_TEXT,
+                       insertbackground=CLR_TEXT, disabledbackground=CLR_CARD)
+        ent.insert(0, val)
+        ent.selection_range(0, "end")
+        ent.icursor("end")
+        ent.place(x=bx + 1, y=by + 1, width=max(24, bw - 2),
+                  height=max(18, bh - 2))
+        ent.lift()
+        box["entry"] = ent
+        ent.bind("<Return>", close_overlay)
+        ent.bind("<Escape>", close_overlay)
+        ent.bind("<FocusOut>", close_overlay)
+        # Ctrl+C：让 Entry 的类绑定先完成复制，再顺手收起浮层
+        ent.bind("<Control-c>", lambda _e: ent.after_idle(close_overlay))
+        ent.bind("<Control-C>", lambda _e: ent.after_idle(close_overlay))
+        ent.bind("<Control-Insert>", lambda _e: ent.after_idle(close_overlay))
+        try:
+            ent.focus_set()
+        except Exception:
+            pass
+        return True
+
+    def on_double(event):
+        try:
+            if str(tree.identify_region(event.x, event.y)) not in ("cell", "tree"):
+                return
+        except Exception:
+            return
+        iid = tree.identify_row(event.y)
+        col = str(tree.identify_column(event.x) or "")
+        if open_overlay_at(iid, col):
+            return "break"                  # 已开浮层：别让默认双击行为捣乱
+
+    def menu_pick_text():
+        open_overlay_at(state.get("iid") or "", state.get("col") or "")
+
     def sel_or_all():
         sel = list(tree.selection())
         return sel or tree_all_iids(tree)
@@ -3123,7 +3211,7 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
         return "break"
 
     # 菜单项下标（entryconfigure 用）
-    I_CELL, I_IMG, I_RANGE, I_SEL, I_ALLH, I_ALLD = 0, 1, 3, 4, 6, 7
+    I_CELL, I_IMG, I_RANGE, I_SEL, I_ALLH, I_ALLD, I_TEXT = 0, 1, 3, 4, 6, 7, 8
     menu = tk.Menu(tree, tearoff=0, bg=CLR_CARD, fg=CLR_TEXT, activebackground=CLR_PRIMARY,
                    activeforeground=CLR_ON_PRIMARY, bd=0, relief="flat",
                    font=(FONT_UI, 9))
@@ -3138,6 +3226,8 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
                      command=lambda: do_copy(tree_all_iids(tree), True))
     menu.add_command(label="复制全部（仅数据）",
                      command=lambda: do_copy(tree_all_iids(tree), False))
+    menu.add_command(label="选取该单元格文字（可自由选择部分，双击亦可）",
+                     command=menu_pick_text)
 
     def on_right_click(event):
         iid = tree.identify_row(event.y)
@@ -3164,6 +3254,7 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
                 has_img = False
         try:
             menu.entryconfigure(I_CELL, state=("normal" if (iid and col) else "disabled"))
+            menu.entryconfigure(I_TEXT, state=("normal" if (iid and col) else "disabled"))
             menu.entryconfigure(I_IMG, state=("normal" if has_img else "disabled"))
             if b:
                 menu.entryconfigure(
@@ -3187,6 +3278,11 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
     tree.bind("<Control-c>", on_copy_key)
     tree.bind("<Control-C>", on_copy_key)
     tree.bind("<Control-Insert>", on_copy_key)
+    tree.bind("<Double-Button-1>", on_double, add="+")
+    tree.bind("<MouseWheel>", close_overlay, add="+")   # 滚动后格会移位，直接收起
+    tree.bind("<Button-4>", close_overlay, add="+")     # X11 滚轮向上
+    tree.bind("<Button-5>", close_overlay, add="+")     # X11 滚轮向下
+    tree.bind("<Configure>", close_overlay, add="+")    # 列宽 / 窗口变化同理
     tree.bind("<ButtonPress-1>", on_press, add="+")
     tree.bind("<B1-Motion>", on_motion, add="+")
     tree.bind("<ButtonRelease-1>", on_release, add="+")
