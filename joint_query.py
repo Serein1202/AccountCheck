@@ -3799,8 +3799,10 @@ class JointApp(object):
         hint.pack(fill="x", padx=10, pady=(8, 0))
         wrap = tk.Frame(tab, bg=page_bg)
         wrap.pack(fill="both", expand=True, padx=10, pady=(6, 8))
+        # 备注等长文本列左对齐（居中会和相邻列重叠），其余列居中显示
+        aligns = ["left" if h in ("备注", "说明") else "center" for h in headers]
         view = c.ResultTextView(wrap, headers=list(headers), widths=list(widths),
-                                font=self.f_body, bg=page_bg)
+                                font=self.f_body, bg=page_bg, aligns=aligns)
         view.pack(fill="both", expand=True)
         tab.hint = hint
         tab.view = view
