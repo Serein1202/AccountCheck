@@ -960,9 +960,11 @@ def build_installer_script(new_exe, target, log_file=""):
         lines.append("chcp 65001 >nul")
     lines += [
         "setlocal enableextensions",
-        # PyInstaller onefile：继承到的 _MEIPASS2 会让新 exe 跳过解包、
-        # 去用旧进程即将删除的 _MEI 目录，启动即报「Failed to load Python DLL」
-        'set "_MEIPASS2="',
+        # PyInstaller onefile：继承到的解包目录标记（_MEI* / _PYI*，6.x 用
+        # _PYI_*）会让新 exe 跳过解包、去用旧进程即将删除的 _MEI 目录，
+        # 启动即报「Failed to load Python DLL」。按前缀清空后再 start。
+        'for /f "delims==" %%v in (\'set _MEI 2^>nul\') do set "%%v="',
+        'for /f "delims==" %%v in (\'set _PYI 2^>nul\') do set "%%v="',
         'set "NEW=%s"' % new_exe,
         'set "TGT=%s"' % target,
         'set "LOG=%s"' % log_file,
@@ -1018,9 +1020,10 @@ for ($i = 1; $i -le 120; $i++) {
 $msg = (Get-Date).ToString('s') + ' update ' + $(if ($ok) { 'ok' } else { 'FAILED' })
 try { Add-Content -LiteralPath $log -Value $msg -ErrorAction SilentlyContinue } catch {}
 if ($ok) { Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue }
-# PyInstaller onefile：继承到的 _MEIPASS2 会让新 exe 跳过解包、去用旧进程
-# 即将被删除的 _MEI 目录，报「Failed to load Python DLL」。必须剥掉再启动。
-try { Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue } catch {}
+# PyInstaller onefile：继承到的解包目录标记（_MEI* / _PYI*，6.x 用 _PYI_*）
+# 会让新 exe 跳过解包、去加载旧进程退出即删除的 _MEI 目录里的 python DLL。
+# 按前缀整体清理后再启动新 exe。
+Get-ChildItem Env:_MEI*, Env:_PYI* -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
 Start-Process -FilePath $tgt
 """
 
@@ -1052,18 +1055,27 @@ def build_installer_command(new_exe, target, log_file=""):
 def _clean_runtime_env():
     """给「重启新版 exe」用的干净环境变量
 
-    PyInstaller onefile 的 bootloader 会在进程环境里设置 `_MEIPASS2`（指向
-    本进程的临时解包目录 _MEIxxxxx）。这个变量会随 subprocess 一路继承下去：
-    旧 exe → PowerShell/.bat → 新 exe。新 exe 的 bootloader 一旦看到
-    `_MEIPASS2` 已存在，就**跳过解包**、直接拿旧进程的 _MEI 目录当自己的
-    库目录 —— 而旧进程退出时会删掉那个目录，于是新 exe 报
-    「Failed to load Python DLL ...\\python3xx.dll，找不到指定的模块」。
-    这正是自动更新重启后必现弹窗的根因。这里把 PyInstaller 的进程内标记
-    全部剥掉，让新 exe 像正常双击启动一样重新解包。
+    PyInstaller onefile 的 bootloader 会在进程环境里设置一组「解包目录」
+    标记变量，子进程全部继承：旧 exe → 安装器 → 新 exe。新 exe 的
+    bootloader 一旦看到这些变量已存在，就**跳过解包**、直接拿旧进程的
+    _MEIxxxxx 目录当自己的库目录 —— 而旧进程退出时会删掉那个目录，于是
+    新 exe 报「Failed to load Python DLL ...\\python3xx.dll，找不到指定的
+    模块」。这正是自动更新重启后必现弹窗的根因。
+
+    变量名随 PyInstaller 大版本变过：
+      · 旧版（≤5.x）：`_MEIPASS2`、`_MEIPASS`
+      · 6.x（含 CI 用的 6.18）：`_PYI_APPLICATION_HOME_DIR`、
+        `_PYI_ARCHIVE_FILE`、`_PYI_PARENT_PROCESS_LEVEL`、`_PYI_SPLASH_IPC`
+        等（first attempt 只剥了 _MEIPASS2，线上仍弹窗，教训）
+    所以这里按 `_MEI*` / `_PYI*` 前缀整体剥离，并顺带清掉 CPython 的
+    `PYTHONHOME` / `PYTHONPATH` / `__PYVENV_LAUNCHER__`，让新 exe 像正常
+    双击启动一样重新解包，今后 PyInstaller 再改名也不受影响。
     """
     env = dict(os.environ)
-    for key in ("_MEIPASS2", "_MEIPASS", "__PYVENV_LAUNCHER__",
-                "PYTHONHOME", "PYTHONPATH"):
+    for key in list(env):
+        if key.startswith("_MEI") or key.startswith("_PYI"):
+            env.pop(key, None)
+    for key in ("__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH"):
         env.pop(key, None)
     return env
 
@@ -1208,22 +1220,25 @@ def offline_selftest(printer=None):
                                      os.path.join(tempfile.gettempdir(), target_name),
                                      os.path.join(tempfile.gettempdir(), "更新 日志.log"))
         decoded = base64.b64decode(cmd[-1]).decode("utf-16-le")
-        # 自重启必须剥掉 PyInstaller 的 _MEIPASS2，否则新 exe 跳过解包、
-        # 去加载旧进程退出即删除的 _MEI 目录里的 python DLL，启动即弹窗。
-        # 源码运行时环境里本没有这些变量，先注入再验证 _clean_runtime_env 生效。
-        os.environ["_MEIPASS2"] = r"C:\fake\_MEItest"
-        os.environ["_MEIPASS"] = os.environ["_MEIPASS2"]
+        # 自重启必须剥掉 PyInstaller 的解包目录标记（旧版 _MEI* / 6.x _PYI*），
+        # 否则新 exe 跳过解包、去加载旧进程退出即删除的 _MEI 目录里的
+        # python DLL，启动即弹窗。源码运行时环境里本没有这些变量，
+        # 先注入再验证 _clean_runtime_env 按前缀剥离生效。
+        inject = {"_MEIPASS2": r"C:\fake\_MEItest",
+                  "_PYI_APPLICATION_HOME_DIR": r"C:\fake\_MEItest",
+                  "_PYI_ARCHIVE_FILE": r"C:\fake\_MEItest"}
+        os.environ.update(inject)
         try:
             clean = _clean_runtime_env()
-            env_ok = not {"_MEIPASS2", "_MEIPASS"} & set(clean)
+            env_ok = not (set(inject) & set(clean))
         finally:
-            os.environ.pop("_MEIPASS2", None)
-            os.environ.pop("_MEIPASS", None)
+            for k in inject:
+                os.environ.pop(k, None)
         need("替换命令生成",
              "powershell" in cmd[0].lower() and "Copy-Item" in decoded
              and "Move-Item" in decoded and target_name in decoded
              and "Start-Process" in decoded
-             and "_MEIPASS2" in decoded and env_ok)
+             and "Env:_MEI*" in decoded and "Env:_PYI*" in decoded and env_ok)
     except Exception as exc:                            # noqa: BLE001
         need("替换命令生成", False, _short(exc))
 
@@ -1234,7 +1249,7 @@ def offline_selftest(printer=None):
             body = f.read().decode("utf-8-sig", "replace")
         need("替换脚本兜底生成",
              'copy /Y' in body and "tgt.exe" in body and "@echo off" in body
-             and '_MEIPASS2=' in body)
+             and "set _MEI" in body and "set _PYI" in body)
         try:
             shutil.rmtree(os.path.dirname(script), ignore_errors=True)
         except Exception:
