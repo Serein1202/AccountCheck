@@ -2574,6 +2574,167 @@ def build_table(parent, columns, headers, widths, stretch=(), style_name="Ban.Tr
     return tree
 
 
+class ResultTextView(tk.Frame):
+    """结果文本视图：一条记录一行，替代 Treeview——文字可直接拖动选择
+
+    用 tk.Text 的像素制表位对齐各列（默认居中，观感与原表格一致）：
+    - 鼠标拖动就是原生文字选区，想选哪段选哪段，Ctrl+C 直接复制所选
+      （列间是制表符，粘进 Excel/WPS 仍可自动分列）
+    - 右键菜单：复制 / 复制整行 / 全选
+    - on_double(i) 回调实现「双击一行看明细」（i 为记录下标，0 起）
+    - set_rows(rows, tag_fn)：tag_fn(i,row) 返回 ban / unban / normal / fail，
+      整行按状态着色（与原表格同名标签、同色）；斑马底色自动交替
+    """
+
+    HEADER_LINES = 2                          # 表头行 + 分隔线
+
+    def __init__(self, master, headers, widths, font=None, bg=CLR_CARD,
+                 on_double=None, center=True):
+        super().__init__(master, bg=bg)
+        self.headers = [str(h) for h in headers]
+        self._widths = [max(40, int(w)) for w in widths]
+        self._rows = []
+        self.on_double = on_double
+        self._center = center
+        self._bg = bg
+        self._font = font or (FONT_UI, 10)
+
+        self.text = tk.Text(
+            self, wrap="none", state="disabled", bd=0, highlightthickness=0,
+            background=bg, foreground=CLR_TEXT, font=self._font,
+            cursor="xterm", spacing1=2, spacing3=2, padx=10, pady=4,
+            insertwidth=0,
+            selectbackground=CLR_SEL, selectforeground=CLR_ON_PRIMARY_CONTAINER,
+            tabs=self._tabstops(),
+        )
+        try:                                  # 字重加粗的表头（复制自 MTabView 的做法）
+            fb = tkfont.Font(font=self._font) if not isinstance(self._font, tkfont.Font) \
+                else self._font
+            self._font_hdr = fb.copy() if isinstance(fb, tkfont.Font) else fb
+            if isinstance(self._font_hdr, tkfont.Font):
+                self._font_hdr.configure(weight="bold")
+        except Exception:
+            self._font_hdr = self._font
+        for name, fg in (("ban", CLR_ERROR), ("unban", CLR_SUB),
+                         ("normal", CLR_SUCCESS), ("fail", CLR_WARNING)):
+            self.text.tag_configure(name, foreground=fg)
+        self.text.tag_configure("hdr", foreground=CLR_SUB, font=self._font_hdr)
+        self.text.tag_configure("sep", foreground=CLR_LINE)
+        self.text.tag_configure("z0", background=bg)
+        self.text.tag_configure("z1", background=CLR_ZEBRA)
+
+        ysb = MScrollbar(self, target=self.text, orient="vertical",
+                         thickness=14, bg=CLR_CARD)
+        xsb = MScrollbar(self, target=self.text, orient="horizontal",
+                         thickness=14, bg=CLR_CARD)
+        self.text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.text.bind("<Double-Button-1>", self._on_double)
+        self.text.bind("<Button-3>", self._on_menu)
+        self.text.bind("<Button-2>", self._on_menu)     # macOS 习惯
+        self._menu_pt = (0, 0)
+
+    # ---- 布局 ----
+    def _tabstops(self):
+        """按列宽累计出像素制表位；居中模式停在每列中点，与原表格观感一致"""
+        stops, x = [], 0
+        for w in self._widths:
+            x += w
+            stops.append(x - w / 2.0 if self._center else x)
+        if self._center:
+            return tuple("%dc" % round(s) for s in stops)
+        return tuple(int(s) for s in stops)
+
+    # ---- 数据 ----
+    @staticmethod
+    def _clean_cell(v):
+        return str(v).replace("\t", "    ").replace("\r", " ").replace("\n", " ⏎ ")
+
+    def set_rows(self, rows, tag_fn=None):
+        self._rows = [tuple("" if v is None else str(v) for v in r) for r in rows]
+        t = self.text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end", "\t".join(self.headers) + "\n", "hdr")
+        t.insert("end", "─" * max(40, sum(self._widths) // 8) + "\n", "sep")
+        for i, row in enumerate(self._rows):
+            status = None
+            if tag_fn:
+                try:
+                    status = tag_fn(i, row)
+                except Exception:
+                    status = None
+            tags = ["z%d" % (i % 2)]
+            if status:
+                tags.append(str(status))
+            t.insert("end", "\t".join(self._clean_cell(v) for v in row) + "\n",
+                     tuple(tags))
+        t.configure(state="disabled")
+
+    def clear(self):
+        self._rows = []
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.configure(state="disabled")
+
+    def row_values(self, i):
+        """第 i 条记录的原始单元格值（列表），供双击明细等使用"""
+        return list(self._rows[i]) if 0 <= i < len(self._rows) else []
+
+    # ---- 交互 ----
+    def _line_at(self, x, y):
+        try:
+            return int(str(self.text.index("@%d,%d" % (x, y))).split(".")[0])
+        except Exception:
+            return 0
+
+    def _on_double(self, event):
+        n = self._line_at(event.x, event.y) - self.HEADER_LINES
+        if self.on_double and 1 <= n <= len(self._rows):
+            self.on_double(n - 1)
+        return "break"
+
+    def _copy_to_clip(self, s):
+        if not s:
+            return
+        self.text.clipboard_clear()
+        self.text.clipboard_append(s)
+        _copy_toast(self.text, "已复制")
+
+    def _copy_sel(self):
+        try:
+            self._copy_to_clip(self.text.get("sel.first", "sel.last"))
+        except Exception:
+            pass
+
+    def _on_menu(self, event):
+        self._menu_pt = (event.x, event.y)
+        menu = tk.Menu(self, tearoff=0, bg=CLR_CARD, fg=CLR_TEXT,
+                       activebackground=CLR_PRIMARY, activeforeground=CLR_ON_PRIMARY,
+                       bd=0, relief="flat", font=(FONT_UI, 9))
+        menu.add_command(label="复制所选文字", command=self._copy_sel)
+        menu.add_command(
+            label="复制整行",
+            command=lambda: self._copy_to_clip(
+                self.text.get("%d.0" % self._line_at(*self._menu_pt),
+                              "%d.end" % self._line_at(*self._menu_pt))))
+        menu.add_command(label="全选",
+                         command=lambda: self.text.tag_add("sel", "1.0", "end"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+        return "break"
+
+
 # ---------------------------------------------------------------- 表格复制能力
 def _tree_shows_tree(tree):
     """该表格是否带 tree 列（#0）——tree 列不能放数据列，取值方式不同"""

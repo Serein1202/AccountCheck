@@ -2842,7 +2842,7 @@ class JointApp(object):
         self._restarting = False         # 正在退出以完成更新替换
 
         self.root = tk.Tk()
-        self.root.title(APP_TITLE + " v" + VERSION)
+        self.root.title(APP_TITLE + " v" + CURRENT_VERSION)
         self.root.configure(bg=amis_query.CLR_BG)
         self.root.geometry(self._center_geometry(1460, 980))
         self.root.minsize(1140, 760)
@@ -3783,6 +3783,13 @@ class JointApp(object):
     # ---------------- 结果区 ----------------
     def _make_tab(self, nb, title, columns, headers, widths, stretch=(), height=12,
                   anchor="center"):
+        """结果页签：纯文本视图（一条记录一行，文字可直接拖动选择）
+
+        此前这里用 Treeview 表格，但表格只能整格选中，用户拖动选不了格内
+        文字；改为 ResultTextView——像素制表位对齐的只读文本，观感接近
+        表格，而选择/复制完全是原生文字操作。columns/stretch/anchor 参数
+        保留签名兼容（文本视图按 widths 定位，不需要它们）。
+        """
         c = amis_query
         page_bg = getattr(nb, "page_bg", c.CLR_CARD)   # 与宿主卡片同色，避免卡片里出现灰底块
         tab = tk.Frame(nb, bg=page_bg)
@@ -3792,11 +3799,12 @@ class JointApp(object):
         hint.pack(fill="x", padx=10, pady=(8, 0))
         wrap = tk.Frame(tab, bg=page_bg)
         wrap.pack(fill="both", expand=True, padx=10, pady=(6, 8))
-        tree = c.build_table(wrap, columns, headers, widths, stretch=stretch,
-                             height=height, anchor=anchor)
-        c.enable_copy(tree, headers=list(headers))   # Ctrl+C / 右键复制
+        view = c.ResultTextView(wrap, headers=list(headers), widths=list(widths),
+                                font=self.f_body, bg=page_bg)
+        view.pack(fill="both", expand=True)
         tab.hint = hint
-        return tab, tree
+        tab.view = view
+        return tab, view
 
     def _build_results(self, parent):
         c = amis_query
@@ -3807,7 +3815,7 @@ class JointApp(object):
         head = tk.Frame(box, bg=c.CLR_CARD)
         head.pack(fill="x")
         self._section(head, "查询结果",
-                      "双击 amis / ACE 表格任意一行可查看明细；按住左键拖动可框选单元格区域，Ctrl+C 复制，右键有更多复制方式").pack(side="left")
+                      "双击任意一行可查看明细；结果为纯文本，按住左键拖动即可直接选择文字，Ctrl+C 复制，右键有更多复制方式").pack(side="left")
         self.lbl_summary = tk.Label(head, text="尚未查询", font=self.f_sub,
                                     bg=c.CLR_CARD, fg=c.CLR_MUTED)
         self.lbl_summary.pack(side="right")
@@ -3816,22 +3824,21 @@ class JointApp(object):
                                  font=self.f_body)
         nb.pack(fill="both", expand=True, pady=(8, 0))
         self.nb = nb
-        self.tab_ident, self.tree_ident = self._make_tab(
-            nb, "编号识别", IDENT_COLUMNS, IDENT_HEADERS, IDENT_WIDTHS, stretch=("note",))
-        self.tab_amis, self.tree_amis = self._make_tab(
+        self.tab_ident, self.view_ident = self._make_tab(
+            nb, "编号识别", IDENT_COLUMNS, IDENT_HEADERS, IDENT_WIDTHS)
+        self.tab_amis, self.view_amis = self._make_tab(
             nb, "amis 登录封禁", JOINT_AMIS_COLUMNS, JOINT_AMIS_HEADERS,
-            JOINT_AMIS_WIDTHS, stretch=JOINT_AMIS_STRETCH)
-        self.tab_ace, self.tree_ace = self._make_tab(
+            JOINT_AMIS_WIDTHS)
+        self.tab_ace, self.view_ace = self._make_tab(
             nb, "ACE 可疑/处罚", ACE_SUMMARY_COLUMNS, ACE_SUMMARY_HEADERS,
-            ACE_SUMMARY_WIDTHS, stretch=("openid",))
+            ACE_SUMMARY_WIDTHS)
 
-        self.tree_amis.bind("<Double-1>", self._on_amis_dclick)
-        self.tree_ace.bind("<Double-1>", self._on_ace_dclick)
+        self.view_amis.on_double = self._on_amis_dclick
+        self.view_ace.on_double = self._on_ace_dclick
 
     def _clear_tables(self):
-        for tree in (self.tree_ident, self.tree_amis, self.tree_ace):
-            for item in tree.get_children():
-                tree.delete(item)
+        for view in (self.view_ident, self.view_amis, self.view_ace):
+            view.clear()
         self.tab_ident.hint.configure(text="尚未查询")
         self.tab_amis.hint.configure(text="尚未查询")
         self.tab_ace.hint.configure(text="尚未查询")
@@ -3840,15 +3847,8 @@ class JointApp(object):
         self.nb.tab(self.tab_ace, text="ACE 可疑/处罚")
         self.lbl_summary.configure(text="查询中…")
 
-    def _fill_tree(self, tree, rows, tag_fn=None):
-        tree.delete(*tree.get_children())
-        for i, row in enumerate(rows, 1):
-            tags = ["odd" if i % 2 else "even"]
-            if tag_fn:
-                extra = tag_fn(i - 1, row)
-                if extra:
-                    tags.append(extra)
-            tree.insert("", "end", values=row, tags=tuple(tags))
+    def _fill_view(self, view, rows, tag_fn=None):
+        view.set_rows(rows, tag_fn=tag_fn)
 
     # ---------------- 渲染结果 ----------------
     def _render_result(self, res):
@@ -3857,7 +3857,7 @@ class JointApp(object):
 
         # 1) 编号识别
         rows = [it.as_row() for it in res.items]
-        self._fill_tree(self.tree_ident, rows,
+        self._fill_view(self.view_ident, rows,
                         lambda i, _row: "fail" if res.items[i].skipped else "normal")
         skipped = sum(1 for it in res.items if it.skipped)
         self.nb.tab(self.tab_ident, text="编号识别（%d）" % len(rows))
@@ -3868,7 +3868,7 @@ class JointApp(object):
         # 2) amis 汇总
         summaries = res.amis_summaries
         if res.amis and summaries:
-            self._fill_tree(self.tree_amis, res.amis_summary_rows(),
+            self._fill_view(self.view_amis, res.amis_summary_rows(),
                             lambda i, _row: amis_query.summary_tag(summaries[i]))
             banned = res.amis_banned_count()
             tip = ("共 %d 个编号，封禁中 %d 个、正常 %d 个%s；双击某行查看该编号的封禁明细。"
@@ -3881,7 +3881,7 @@ class JointApp(object):
 
         # 3) ACE 汇总（界面不显示备注列，失败原因见双击明细与标签页提示）
         ace_rows = res.ace_summary_rows(with_note=False)
-        self._fill_tree(self.tree_ace, ace_rows, self._ace_tag)
+        self._fill_view(self.view_ace, ace_rows, self._ace_tag)
         hits = res.ace_hit_count()
         bad = sum(1 for oid in res.ace_order
                   if (res.ace.get(oid) or {}).get("check_error")
@@ -3966,29 +3966,11 @@ class JointApp(object):
         mark("查询失败：%s" % text, category="query", level="error")
         messagebox.showerror("查询失败", text, parent=self.root)
 
-    def _dclicked_iid(self, tree, event):
-        """双击命中的行 id
-
-        表格已支持多选（便于复制），此时 selection()[0] 不一定是双击的那一行，
-        故优先用光标位置定位，取不到再退回选中项。
-        """
-        try:
-            iid = tree.identify_row(getattr(event, "y", 0)) if event is not None else ""
-            if iid:
-                return iid
-        except Exception:
-            pass
-        sel = tree.selection()
-        return sel[0] if sel else ""
-
     # ---------------- 明细弹窗 ----------------
-    def _on_amis_dclick(self, event=None):
+    def _on_amis_dclick(self, idx):
+        """双击 amis 文本视图第 idx 行（0 起）→ 查看该编号封禁明细"""
         if not self.result:
             return
-        iid = self._dclicked_iid(self.tree_amis, event)
-        if not iid:
-            return
-        idx = self.tree_amis.index(iid)
         summaries = self.result.amis_summaries
         if idx >= len(summaries):
             return
@@ -4010,13 +3992,11 @@ class JointApp(object):
             report_exception(exc, tags={"stage": "amis-detail-dialog"})
             messagebox.showerror("打开明细失败", format_error(exc), parent=self.root)
 
-    def _on_ace_dclick(self, event=None):
+    def _on_ace_dclick(self, idx):
+        """双击 ACE 文本视图第 idx 行（0 起）→ 查看核查与处罚明细"""
         if not self.result:
             return
-        iid = self._dclicked_iid(self.tree_ace, event)
-        if not iid:
-            return
-        values = self.tree_ace.item(iid, "values")
+        values = self.view_ace.row_values(idx)
         if not values:
             return
         openid = str(values[0])
