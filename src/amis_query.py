@@ -2911,9 +2911,10 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
     - 选中若干行后 Ctrl+C：复制选中行；既无选区也无选中行时复制全部
     - 右键菜单：复制该单元格 / 复制图片（截图格）/ 复制选中区域 /
       复制选中行（含表头）/ 复制全部
-    - 双击单元格（或右键「选取该单元格文字」）：在该格上叠一个文本框并
-      全选内容，可自由选择其中一部分再 Ctrl+C（复制后自动收起；
-      点击别处 / Esc / 滚动也能关闭），适合「只要无端ID前几位」这类场景
+    - 双击单元格（或右键「选取该单元格文字」）：该格原地变为可选中文字
+      （无边框、底色与所在行一致，看起来就是格里的文字），内容全选，
+      可自由选择其中一部分再 Ctrl+C（复制后自动复原；点击别处 / Esc /
+      滚动也会复原），适合「只要无端ID前几位」这类场景
     内容为制表符分隔的纯文本，粘到表格类软件可自动分列。
     row_provider(iid) 自定义一行的取值；image_provider(iid, idx, fetch)
     返回图片字节时该格按图片复制（fetch=False 只查缓存，不触发下载）。
@@ -3129,13 +3130,22 @@ def enable_copy(tree, headers=None, row_provider=None, image_provider=None):
                   or (FONT_UI, 10)
         except Exception:
             fnt = (FONT_UI, 10)
+        # 底色跟随所在行（斑马行 / 普通行），无边框 —— 视觉上就是「格子里的
+        # 文字直接可选中」，而不是弹出一个输入框
+        bg = CLR_CARD
+        for t in (tree.item(iid, "tags") or ()):
+            try:
+                c = str(tree.tag_configure(str(t), "background") or "")
+            except Exception:
+                c = ""
+            if c and c.lower() not in ("none", "systembuttonface"):
+                bg = c
+                break
         ent = tk.Entry(tree, justify="center",
                        font=fnt,
-                       relief="flat", bd=0,
-                       highlightthickness=1, highlightbackground=CLR_PRIMARY,
-                       highlightcolor=CLR_PRIMARY,
-                       background=CLR_CARD, foreground=CLR_TEXT,
-                       insertbackground=CLR_TEXT, disabledbackground=CLR_CARD)
+                       relief="flat", bd=0, highlightthickness=0,
+                       background=bg, foreground=CLR_TEXT,
+                       insertbackground=CLR_TEXT, disabledbackground=bg)
         ent.insert(0, val)
         ent.selection_range(0, "end")
         ent.icursor("end")
