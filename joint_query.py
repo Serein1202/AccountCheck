@@ -3799,10 +3799,11 @@ class JointApp(object):
         hint.pack(fill="x", padx=10, pady=(8, 0))
         wrap = tk.Frame(tab, bg=page_bg)
         wrap.pack(fill="both", expand=True, padx=10, pady=(6, 8))
-        # 备注等长文本列左对齐（居中会和相邻列重叠），其余列居中显示
-        aligns = ["left" if h in ("备注", "说明") else "center" for h in headers]
+        # 一律居中显示（含「备注」等长文本列）；行高沿用原表格的 34px
+        aligns = ["center"] * len(headers)
         view = c.ResultTextView(wrap, headers=list(headers), widths=list(widths),
-                                font=self.f_body, bg=page_bg, aligns=aligns)
+                                font=self.f_body, bg=page_bg, aligns=aligns,
+                                rowheight=34)
         view.pack(fill="both", expand=True)
         tab.hint = hint
         tab.view = view
@@ -4195,6 +4196,76 @@ def ensure_console_output():
         pass
 
 
+def _check_resultview(check, warn):
+    """自检结果文本视图的几何：行高 34px、每列在自身槽位内居中、复制不分列错位
+
+    这些是纯数值/纯函数，不需要 Tk 环境也能验。历史上「制表位写法」翻过车
+    （把对齐词写进距离 → 整表飞到视口外，代码却不报错），只有断言拦得住。
+    """
+    c = amis_query
+    for name in ("ResultTextView", "result_tabstops", "result_row_spacing"):
+        if not hasattr(c, name):
+            check("结果文本视图可用", False, "缺少 %s" % name)
+            return
+
+    # ① 行高：spacing1 + spacing3 + 字体 linespace 必须正好等于目标行高
+    heights = []
+    for rh, ls in ((34, 19), (34, 23), (30, 16), (34, 34), (20, 26)):
+        s1, s3 = c.result_row_spacing(rh, ls)
+        heights.append(s1 + s3 + min(rh, ls) == rh)
+    _ls = 19                                   # Microsoft YaHei UI 10 的实测 linespace
+    _s1, _s3 = c.result_row_spacing(c.ResultTextView.ROW_HEIGHT, _ls)
+    check("结果视图行高 %dpx" % c.ResultTextView.ROW_HEIGHT,
+          all(heights) and _s1 + _s3 + _ls == c.ResultTextView.ROW_HEIGHT
+          and c.ResultTextView.ROW_HEIGHT == 34,
+          "spacing1=%d + spacing3=%d + linespace=%d = %d（原表格 rowheight=34）"
+          % (_s1, _s3, _ls, _s1 + _s3 + _ls))
+
+    # ② 制表位：必须是「数字 + 对齐词」交替的扁平元组，且每个数字正好是
+    #    对应列槽位的中心（槽位左边界 = 前面各列宽之和 + 列间距×序号）
+    widths = list(JOINT_AMIS_WIDTHS)
+    aligns = ["center"] * len(widths)
+    gap = c.ResultTextView.GAP
+    stops = c.result_tabstops(widths, aligns, gap)
+    shape_ok = (isinstance(stops, tuple) and len(stops) == 2 * (len(widths) - 1)
+                and all(isinstance(stops[i], int) for i in range(0, len(stops), 2))
+                and all(stops[i] in ("left", "right", "center", "numeric")
+                        for i in range(1, len(stops), 2)))
+    nums = [stops[i] for i in range(0, len(stops), 2)]
+    mono_ok = all(nums[i] < nums[i + 1] for i in range(len(nums) - 1))
+    center_ok = True
+    _cum = 0
+    for _i in range(len(widths) - 1):
+        _cum += widths[_i]
+        slot_left = _cum + gap * (_i + 1)      # 第 _i+1 列的槽位左边界
+        if nums[_i] != slot_left + widths[_i + 1] // 2:
+            center_ok = False
+    check("结果视图列居中", shape_ok and mono_ok and center_ok,
+          "%d 列制表位均落在各自槽位中心，间距 %dpx，写法为扁平列表" % (len(widths), gap))
+
+    # ③ 最后一列是长文本列（备注）且无右邻，居中不会压到别的列
+    last_slot_left = sum(widths[:-1]) + gap * (len(widths) - 1)
+    tail_ok = (JOINT_AMIS_HEADERS[-1] == "备注" and IDENT_HEADERS[-1] == "备注"
+               and nums[-1] == last_slot_left + widths[-1] // 2)
+    check("结果视图末列（备注）居中安全", tail_ok,
+          "整表宽 %dpx，末列右端 = 制表位中心 + 列宽/2"
+          % (sum(widths) + gap * (len(widths) - 1)))
+
+    # ④ 源码级：确认结果区确实按「全部居中 + 行高 34」渲染
+    #    标记串用拼接写，避免断言自己出现在源码里而变成「永远通过」
+    try:
+        _src = open(os.path.join(SCRIPT_DIR, "joint_query.py"), encoding="utf-8").read()
+    except Exception:
+        _src = ""                              # 打包成 exe 后没有 .py 源码
+    if _src:
+        mark_align = 'aligns = ["' + "center" + '"] * len(headers)'
+        mark_hrow = "rowheight" + "=34)"          # 加右括号，只匹配结果视图那处调用
+        check("结果区全部居中显示", mark_align in _src and mark_hrow in _src,
+              "备注等长文本列同样居中；行高沿用原表格的 34px")
+    else:
+        warn("结果区全部居中显示", "打包版没有 .py 源码，跳过该源码级检查")
+
+
 def selfcheck():
     """离线自检：模块接口、编号识别、结果渲染与 CSV 导出逻辑（不联网）"""
     ok = True
@@ -4223,6 +4294,7 @@ def selfcheck():
                               ("RoundBox", "MButton", "MTextField", "Segmented",
                                "MTabView", "build_table", "MScrollbar", "DetailDialog")),
           "RoundBox / MButton / MTextField / Segmented / MTabView / build_table / DetailDialog 存在")
+    _check_resultview(check, warn)
     check("表格复制能力可用", all(hasattr(amis_query, n) for n in
                                   ("enable_copy", "copy_rows", "copy_cell", "tree_row_values",
                                    "copy_range", "range_bounds", "display_columns",

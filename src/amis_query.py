@@ -2574,13 +2574,56 @@ def build_table(parent, columns, headers, widths, stretch=(), style_name="Ban.Tr
     return tree
 
 
+# ---------------------------------------------------------------- 结果文本视图几何
+# 这两段几何计算刻意做成**纯函数**：Tk 制表位一旦写错（历史上出现过把
+# 「像素+对齐词」写成 "100 center" → 被 Tk 当 100 厘米解析，整表排到视口外），
+# 外观会彻底崩掉但代码本身不报错，只能靠自检断言兜住。纯函数无需 Tk 环境，
+# 自检里可以直接验数值。
+def result_tabstops(widths, aligns, gap=12):
+    """由列宽算出 tk.Text 制表位：每列在**自己的槽位内**居中
+
+    制表位语义是「其后文字的对齐基准点」——"center" 表示文字中心落在该像素
+    处，所以基准点取槽位中心 = 槽位左边界 + 列宽/2。若把累加出来的槽位**左
+    边界**直接当中心用，整列会向左偏半个列宽，列间距随文字宽度忽大忽小。
+
+    首列没有前置制表符，保持贴左（复制出的 TSV 不会多出空的首列，粘进
+    Excel/WPS 仍可直接分列）。
+
+    返回值必须是**扁平列表**：(像素, 对齐, 像素, 对齐, …)。
+    """
+    widths = list(widths)
+    aligns = list(aligns) if aligns else ["center"] * len(widths)
+    stops = []
+    x = 0
+    for i in range(len(widths) - 1):
+        x += int(widths[i]) + int(gap)                  # 下一列槽位左边界
+        nx = int(widths[i + 1])
+        stops.append(x + nx // 2)                       # 槽位中心 = 对齐基准点
+        stops.append(aligns[min(i + 1, len(aligns) - 1)])
+    return tuple(stops)
+
+
+def result_row_spacing(rowheight, linespace):
+    """由目标行高反推 tk.Text 的上下留白
+
+    Text 相邻两行基线间距 = 字体 linespace + spacing1 + spacing3（pady 只管
+    控件内边距，不影响行距）。原表格是 ttk.Treeview 的 rowheight=34，按同一
+    数值折算，视觉密度才和以前一致；余数让给上留白。
+    """
+    pad = max(0, int(rowheight) - int(linespace))
+    return pad - pad // 2, pad // 2
+
+
 class ResultTextView(tk.Frame):
     """结果文本视图：一条记录一行，替代 Treeview——文字可直接拖动选择
 
-    用 tk.Text 的像素制表位对齐各列，默认**居中**（与原表格一致）；
-    长文本列（如「备注」）可传 aligns 指定左对齐，避免长文字居中后与
-    相邻列重叠。对齐写法必须是扁平列表 `像素 对齐 像素 对齐…`——嵌套
+    用 tk.Text 的像素制表位对齐各列，每列在**自己的槽位内居中**（与原
+    表格一致）。对齐写法必须是扁平列表 `像素 对齐 像素 对齐…`——嵌套
     `{像素 center}` 会被 Tk 当距离解析（c = 厘米），初版曾因此整表飞出。
+
+    行高由 rowheight 决定（默认 34，与原表格 ttk.Treeview 的 rowheight
+    相同）：Text 的行距 = 字体 linespace + spacing1 + spacing3，所以按目标
+    行高折算上下留白，观感才和以前的表格一致。
 
     - 鼠标拖动就是原生文字选区，想选哪段选哪段，Ctrl+C 直接复制所选
       （列间是制表符，粘进 Excel/WPS 仍可自动分列）
@@ -2591,9 +2634,11 @@ class ResultTextView(tk.Frame):
     """
 
     HEADER_LINES = 2                          # 表头行 + 分隔线
+    ROW_HEIGHT = 34                           # 默认行高：与原表格 rowheight=34 对齐
+    GAP = 12                                  # 相邻列槽位之间的空隙（像素）
 
     def __init__(self, master, headers, widths, font=None, bg=CLR_CARD,
-                 on_double=None, aligns=None):
+                 on_double=None, aligns=None, rowheight=None, gap=None):
         super().__init__(master, bg=bg)
         self.headers = [str(h) for h in headers]
         self._widths = [max(40, int(w)) for w in widths]
@@ -2602,11 +2647,14 @@ class ResultTextView(tk.Frame):
         self.on_double = on_double
         self._bg = bg
         self._font = font or (FONT_UI, 10)
+        self._rowheight = int(rowheight or self.ROW_HEIGHT)
+        self._gap = self.GAP if gap is None else max(0, int(gap))
+        s1, s3 = self._row_spacing(self._rowheight)
 
         self.text = tk.Text(
             self, wrap="none", state="disabled", bd=0, highlightthickness=0,
             background=bg, foreground=CLR_TEXT, font=self._font,
-            cursor="xterm", spacing1=2, spacing3=2, padx=10, pady=4,
+            cursor="xterm", spacing1=s1, spacing3=s3, padx=10, pady=4,
             insertwidth=0,
             selectbackground=CLR_SEL, selectforeground=CLR_ON_PRIMARY_CONTAINER,
             tabs=self._tabstops(),
@@ -2647,22 +2695,17 @@ class ResultTextView(tk.Frame):
         self._menu_pt = (0, 0)
 
     # ---- 布局 ----
-    def _tabstops(self):
-        """按列宽累计出像素制表位，默认居中；aligns 指定 "left" 的长文本列
-        （如「备注」）左对齐，避免与相邻列重叠。
+    def _row_spacing(self, rowheight):
+        """按目标行高折算 spacing1/spacing3（见 result_row_spacing）"""
+        try:
+            ls = int(tkfont.Font(font=self._font).metrics("linespace"))
+        except Exception:
+            ls = 19                                   # Microsoft YaHei UI 10 的实测值
+        return result_row_spacing(rowheight, ls)
 
-        Tk 8.6 的对齐写法是**扁平列表**：`100 center 300 center`（对齐词
-        独立于距离之后）。不能写成嵌套 `{100 center}` 或 `"100 center"`
-        ——后者会被当距离解析，c 恰好是厘米单位，实测整行被排到 2 万像素外。
-        """
-        stops = []
-        x = 0
-        for i, w in enumerate(self._widths[:-1]):
-            x += w + 12
-            align = self._aligns[min(i + 1, len(self._aligns) - 1)]
-            stops.append(x)
-            stops.append(align)
-        return tuple(stops)
+    def _tabstops(self):
+        """按列宽算制表位（见 result_tabstops）"""
+        return result_tabstops(self._widths, self._aligns, self._gap)
 
     # ---- 数据 ----
     @staticmethod
@@ -2716,8 +2759,13 @@ class ResultTextView(tk.Frame):
     def _copy_to_clip(self, s):
         if not s:
             return
-        self.text.clipboard_clear()
-        self.text.clipboard_append(s)
+        try:
+            self.text.clipboard_clear()
+            self.text.clipboard_append(s)
+        except Exception:
+            # 剪贴板被其它程序独占时 Windows 会抛 TclError，直接放弃即可，
+            # 不必让右键菜单里的「复制整行」弹一个未捕获异常
+            return
         _copy_toast(self.text, "已复制")
 
     def _copy_sel(self):
