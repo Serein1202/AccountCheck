@@ -164,10 +164,10 @@ IDENT_COLUMNS = ("idx", "raw", "kinds", "platforms", "note")
 IDENT_HEADERS = ("序号", "编号", "识别类型", "参与平台", "备注")
 IDENT_WIDTHS = (60, 220, 150, 110, 430)
 
-# ACE 汇总表
-ACE_SUMMARY_COLUMNS = ("openid", "check", "punish", "level", "last")
-ACE_SUMMARY_HEADERS = ("OpenID", "核查记录数", "处罚记录数", "最高可疑级别", "最近处罚时间")
-ACE_SUMMARY_WIDTHS = (280, 140, 140, 160, 300)
+# ACE 汇总表（首列序号与「编号识别」页签一致，方便对照）
+ACE_SUMMARY_COLUMNS = ("no", "openid", "check", "punish", "level", "last")
+ACE_SUMMARY_HEADERS = ("序号", "OpenID", "核查记录数", "处罚记录数", "最高可疑级别", "最近处罚时间")
+ACE_SUMMARY_WIDTHS = (60, 280, 140, 140, 160, 300)
 ACE_SUMMARY_HEADERS_CSV = ACE_SUMMARY_HEADERS + ("备注",)   # CSV 导出仍带备注（含失败原因）
 
 _SPLIT_RE = re.compile(r"[,，;；\s]+")
@@ -1330,6 +1330,7 @@ class JointResult(object):
     def ace_summary_rows(self, with_note=True):
         """ACE 汇总表行（与 ACE_SUMMARY_HEADERS 对应）
 
+        首列为「序号」（1 起，按 ace_order 顺序），界面与 CSV 一致。
         OpenID 列为「实际查询用的 OpenID」：角色ID 编号即自身，无端ID 编号为换算出的角色ID。
         with_note=True 时在行尾附加「备注」（失败原因 / 换算来源），仅供 CSV 导出使用；
         界面表格不展示备注列（with_note=False）。
@@ -1338,7 +1339,7 @@ class JointResult(object):
         for wd, rid in (self.ace_converted or {}).items():
             converted_from.setdefault(str(rid), []).append(str(wd))
         rows = []
-        for openid in self.ace_order:
+        for i, openid in enumerate(self.ace_order):
             data = self.ace.get(openid) or {}
             check = data.get("records") or []
             punish = data.get("punish_items") or []
@@ -1349,7 +1350,7 @@ class JointResult(object):
             punish_text = "失败" if data.get("punish_error") else str(len(punish))
             level = ace_query.LEVEL_LABELS.get(data.get("top_level") or "", "")
             note = "；".join(t for t in (data.get("check_error"), data.get("punish_error")) if t)
-            row = [openid, check_text, punish_text, level or "—",
+            row = [str(i + 1), openid, check_text, punish_text, level or "—",
                    data.get("last_punish") or "—"]
             if with_note:
                 origin = converted_from.get(str(openid))
@@ -4002,7 +4003,7 @@ class JointApp(object):
         values = self.view_ace.row_values(idx)
         if not values:
             return
-        openid = str(values[0])
+        openid = str(values[1])                  # 0=序号，1=OpenID
         data = self.result.ace.get(openid) or {}
 
         def work():
@@ -4556,10 +4557,11 @@ def selfcheck():
     _r_ui = _jr.ace_summary_rows(with_note=False)
     _r_csv = _jr.ace_summary_rows()
     check("ACE 汇总列已精简",
-          len(ACE_SUMMARY_COLUMNS) == len(ACE_SUMMARY_HEADERS) == len(ACE_SUMMARY_WIDTHS) == 5
-          and all(len(r) == 5 for r in _r_ui) and all(len(r) == 6 for r in _r_csv)
+          len(ACE_SUMMARY_COLUMNS) == len(ACE_SUMMARY_HEADERS) == len(ACE_SUMMARY_WIDTHS) == 6
+          and all(len(r) == 6 for r in _r_ui) and all(len(r) == 7 for r in _r_csv)
+          and ACE_SUMMARY_HEADERS[0] == "序号" and _r_ui[0][0] == "1"
           and "备注" not in ACE_SUMMARY_HEADERS and "备注" in ACE_SUMMARY_HEADERS_CSV,
-          "界面 %d 列（无备注）/ CSV %d 列（含备注）" % (len(_r_ui[0]), len(_r_csv[0])))
+          "界面 %d 列（首列序号，无备注）/ CSV %d 列（含备注）" % (len(_r_ui[0]), len(_r_csv[0])))
     try:
         _src = open(os.path.join(SCRIPT_DIR, "joint_query.py"), encoding="utf-8").read()
     except Exception:
