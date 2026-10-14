@@ -1760,8 +1760,9 @@ CLR_BAN = CLR_ERROR
 # 明细表列定义（角色ID / 角色名 / 无端ID / 封禁状态 / 封禁类型 / 内部原因 / 对外原因 / 到期时间 / 操作时间 / 操作人）
 DETAIL_COLS = ("roleId", "roleName", "wdId", "status", "forbidType",
                "reason", "outerReason", "expire", "report", "admin")
-DETAIL_WIDTHS = (96, 132, 148, 124, 96, 210, 250, 156, 156, 96)
-DETAIL_STRETCH = ("reason", "outerReason")
+# 内部/对外原因两列给得宽一些：结果区改为「每列在自身槽位内居中」后，超长
+# 文字会向两侧溢出，列宽不够时会视觉上贴到相邻列
+DETAIL_WIDTHS = (96, 132, 148, 124, 96, 260, 300, 156, 156, 96)
 
 
 # ---------------------------------------------------------------- 基础绘制工具
@@ -2651,11 +2652,14 @@ class ResultTextView(tk.Frame):
         self._gap = self.GAP if gap is None else max(0, int(gap))
         s1, s3 = self._row_spacing(self._rowheight)
 
+        # height=8：Text 默认请求 24 行高（≈850px），pack 时会把排在后面的
+        # 兄弟控件（如 ACE 明细的截图缩略图带）挤出页面；实际尺寸由父容器
+        # 决定（调用方都是 fill+expand），这里只把「请求高度」压到合理值
         self.text = tk.Text(
             self, wrap="none", state="disabled", bd=0, highlightthickness=0,
             background=bg, foreground=CLR_TEXT, font=self._font,
             cursor="xterm", spacing1=s1, spacing3=s3, padx=10, pady=4,
-            insertwidth=0,
+            insertwidth=0, height=8,
             selectbackground=CLR_SEL, selectforeground=CLR_ON_PRIMARY_CONTAINER,
             tabs=self._tabstops(),
         )
@@ -3531,6 +3535,8 @@ class DetailDialog(tk.Toplevel):
 
     - 标题体现所查角色：`封禁明细 · 角色名（角色ID 123）`
     - 只展示该角色的记录；无记录 / 查询失败时给出明确文案
+    - 明细用 ResultTextView 纯文本视图渲染，与主结果区完全一致：可直接
+      拖动选字、Ctrl+C 复制片段（早前是 Treeview，只能整格/框选）
     - 支持 Esc、弹窗内「关闭」按钮与标题栏关闭按钮退出
     """
 
@@ -3575,14 +3581,16 @@ class DetailDialog(tk.Toplevel):
         if rows:
             holder = tk.Frame(inner, bg=CLR_CARD)
             holder.pack(fill="both", expand=True, pady=(12, 0))
-            tree = build_table(holder, DETAIL_COLS, TABLE_HEADERS, DETAIL_WIDTHS,
-                               DETAIL_STRETCH, font_bold=f_sec, anchor="center")
-            enable_copy(tree, headers=TABLE_HEADERS)
-            for i, r in enumerate(rows):
-                ban = str(r[3]) == FORBID_STATUS_TEXT[1]
-                tree.insert("", "end", values=r,
-                            tags=("odd" if i % 2 else "even", "ban" if ban else "unban"))
-            tk.Label(inner, text="按住左键拖动可框选单元格区域，Ctrl+C 复制；右键可复制单元格/整行/全部，或按 Esc 退出",
+            self.view = ResultTextView(
+                holder, headers=list(TABLE_HEADERS), widths=list(DETAIL_WIDTHS),
+                font=f_body, bg=CLR_CARD, aligns=["center"] * len(TABLE_HEADERS))
+            self.view.pack(fill="both", expand=True)
+            self.view.set_rows(
+                rows,
+                tag_fn=lambda _i, r: ("ban" if str(r[3]) == FORBID_STATUS_TEXT[1]
+                                      else "unban"))
+            tk.Label(inner, text="结果为纯文本，按住左键拖动即可直接选择文字，"
+                                 "Ctrl+C 复制；右键可复制所选 / 整行 / 全选，或按 Esc 退出",
                      font=f_sub, bg=CLR_CARD, fg=CLR_MUTED).pack(anchor="w", pady=(10, 0))
         else:
             box = RoundBox(inner, radius=16, padding=(18, 18), fill=CLR_HEAD,
