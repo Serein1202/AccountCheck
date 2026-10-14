@@ -102,6 +102,10 @@ except Exception as _imp_err:            # 缺少 src/ 下模块时给出可读�
         "请确认目录结构完整（库模块应位于脚本目录的 src\\ 子目录）：\n  %s"
         % (_imp_err, _MODULE_ROOT)
     )
+try:
+    import net_keepalive                 # HTTP 长连接（连接复用），缺失时功能不受影响
+except Exception:
+    net_keepalive = None
 
 
 try:                                     # 授权校验（license-guard）：缺失则拒绝启动（fail-closed）
@@ -1531,7 +1535,7 @@ def ace_query_one(openid, cookies, log_fn=None):
     return result
 
 
-def run_ace_batch(openids, cookies, log, stopping, workers=None, on_item=None):
+def run_ace_batch(openids, cookies, log, stopping, workers=None, on_item=None, pool=None):
     """并发查询一批 OpenID（每个编号的「核查」与「处罚」两条链路同时进行）
 
     返回 (results, pending, auth_reason)：
@@ -1540,6 +1544,8 @@ def run_ace_batch(openids, cookies, log, stopping, workers=None, on_item=None):
       auth_reason : 登录态失效原因（空串表示没有遇到失效）
 
     on_item(done, total, openid) 为可选回调：每查完一个编号调用一次（进度条用，在工作线程中调用）。
+    pool 为可选的线程池：传入时复用（换算流水线会分多波查询，复用同一个池能让工作线程
+    活得更久，线程内的 HTTP 长连接因此可以跨波复用），不传则本函数自建自销。
     """
     workers = max(1, int(workers or ACE_ACCOUNT_WORKERS))
     total = len(openids)
@@ -1584,7 +1590,9 @@ def run_ace_batch(openids, cookies, log, stopping, workers=None, on_item=None):
 
     log("[ACE] 并发查询 %d 个编号（并发 %d 个账号，每个账号的核查与处罚同时进行）…"
         % (total, min(workers, total)))
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    own_pool = pool is None
+    if own_pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     futures = {}
     stop_notified = {"done": False}
     try:
@@ -1618,7 +1626,8 @@ def run_ace_batch(openids, cookies, log, stopping, workers=None, on_item=None):
                     finish_part(openid, "punish",
                                 {"punish_items": [], "punish_count": 0, "punish_error": msg})
     finally:
-        pool.shutdown(wait=True)
+        if own_pool:
+            pool.shutdown(wait=True)      # 复用外部池时由调用方统一收尾
 
     pending = [openid for openid in openids if openid not in results]
     if auth_reason:
@@ -1794,7 +1803,8 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
             except Exception:
                 pass
 
-    # ---- 进度条：在「无端ID 换算」之后创建（ACE 是否参与取决于换算结果） ----
+    # 本次查询起点的连接统计（收尾时算差值，日志里报「复用了多少次长连接」）
+    _ka_before = net_keepalive.stats() if net_keepalive is not None else None
 
     def stopping():
         return bool(should_stop and should_stop())
@@ -2020,7 +2030,8 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
                     return cookies, ""
                 got, pending, fail_reason = run_ace_batch(
                     pending, cookies, log, stopping, ace_worker_count,
-                    on_item=lambda _n, _t, oid: bump_ace_progress(oid))
+                    on_item=lambda _n, _t, oid: bump_ace_progress(oid),
+                    pool=ace_pool)
                 result.ace.update(got)
                 if not fail_reason:
                     return cookies, ""
@@ -2061,47 +2072,52 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
                 return ""
             return str((info or {}).get("role_id") or "").strip()
 
-        cookies, fail_reason = run_wave([it.raw for it in role_items], cookies)
-
-        # 无端ID：等 amis 阶段发布换算结果（发布的都是 amis 查询顺带拿到的，零额外请求）
+        # 整段 ACE 查询共用一个线程池：换算流水线会分多波发起查询，线程活得久一点，
+        # 线程内的 HTTP 长连接才能跨波复用（每波都换新线程池的话，连接也跟着白建）
+        fail_reason = ""
         remaining = {it.raw: it for it in wuduan_items}
-        while not fail_reason and remaining and not stopping():
-            ready, unresolved = feed.take(list(remaining), timeout=0.5)
-            if not ready and not unresolved:
-                continue                             # amis 还没查到 / 还没结束，继续等
-            fresh = []
-            for raw, rid in list(ready.items()):
-                it = remaining.pop(raw, None)
-                if it is None:
-                    continue
-                rid = str(rid)
-                it.ace_openid = rid
-                it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
-                result.ace_converted[raw] = rid
-                ace_resolved.add(raw)
-                register_ace_raw(rid, raw)
-                fresh.append(rid)
-            for raw in list(unresolved):
-                it = remaining.pop(raw, None)
-                if it is None:
-                    continue
-                rid = convert_one(raw)
-                if rid:
+        ace_pool = concurrent.futures.ThreadPoolExecutor(max_workers=ace_worker_count)
+        try:
+            cookies, fail_reason = run_wave([it.raw for it in role_items], cookies)
+            while not fail_reason and remaining and not stopping():
+                ready, unresolved = feed.take(list(remaining), timeout=0.5)
+                if not ready and not unresolved:
+                    continue                         # amis 还没查到 / 还没结束，继续等
+                fresh = []
+                for raw, rid in list(ready.items()):
+                    it = remaining.pop(raw, None)
+                    if it is None:
+                        continue
+                    rid = str(rid)
                     it.ace_openid = rid
                     it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
                     result.ace_converted[raw] = rid
                     ace_resolved.add(raw)
                     register_ace_raw(rid, raw)
-                    log("[换算] 无端ID %s → 角色ID %s（amis 未返回，已单独补查）" % (raw, rid))
                     fresh.append(rid)
-                else:
-                    it.ace_openid = None
-                    it.note = "%s；未能换算出角色ID（%s），已跳过 ACE" % (
-                        it.note, "amis 登录未完成" if amis_login_error else "接口未返回角色ID")
-                    log("[换算] 无端ID %s 未能换算出角色ID，本次跳过 ACE" % raw)
-                    bump_progress(raw)               # ACE 子任务按「跳过」计入完成，进度条不卡住
-            if fresh:
-                cookies, fail_reason = run_wave(fresh, cookies)
+                for raw in list(unresolved):
+                    it = remaining.pop(raw, None)
+                    if it is None:
+                        continue
+                    rid = convert_one(raw)
+                    if rid:
+                        it.ace_openid = rid
+                        it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
+                        result.ace_converted[raw] = rid
+                        ace_resolved.add(raw)
+                        register_ace_raw(rid, raw)
+                        log("[换算] 无端ID %s → 角色ID %s（amis 未返回，已单独补查）" % (raw, rid))
+                        fresh.append(rid)
+                    else:
+                        it.ace_openid = None
+                        it.note = "%s；未能换算出角色ID（%s），已跳过 ACE" % (
+                            it.note, "amis 登录未完成" if amis_login_error else "接口未返回角色ID")
+                        log("[换算] 无端ID %s 未能换算出角色ID，本次跳过 ACE" % raw)
+                        bump_progress(raw)           # ACE 子任务按「跳过」计入完成，进度条不卡住
+                if fresh:
+                    cookies, fail_reason = run_wave(fresh, cookies)
+        finally:
+            ace_pool.shutdown(wait=True)
 
         if fail_reason:
             result.ace_error = fail_reason
@@ -2163,6 +2179,19 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
     for it in queried:
         if it.ace_openid and it.ace_openid not in result.ace_order:
             result.ace_order.append(it.ace_openid)
+
+    # ---- 收尾：把本次的「连接复用」情况写进日志，便于确认提速是否生效 ----
+    if _ka_before is not None and net_keepalive is not None:
+        try:
+            _ka_after = net_keepalive.stats()
+            _new = _ka_after["new"] - _ka_before["new"]
+            _reused = _ka_after["reused"] - _ka_before["reused"]
+            if _reused or _new:
+                log("[网络] 本次查询共新建 %d 条连接、复用长连接 %d 次%s"
+                    % (_new, _reused,
+                       "（省下约 %d 次 TCP/TLS 握手）" % _reused if _reused else ""))
+        except Exception:
+            pass
 
     return result
 
