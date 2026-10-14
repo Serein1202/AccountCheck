@@ -78,6 +78,7 @@ import base64
 import concurrent.futures
 import csv
 import json
+import net_keepalive
 import os
 import queue
 import re
@@ -666,7 +667,8 @@ def login_by_password(account, password, ldap=True):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        # keep-alive：复用线程内的长连接，省掉每次请求的 TCP/TLS 握手
+        with net_keepalive.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"登录接口返回 HTTP {e.code}（{e.reason}）")
@@ -903,7 +905,7 @@ def _request_forbid_page(role_id, page, token, account, key_type=KEY_TYPE_ROLE):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with net_keepalive.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -999,7 +1001,7 @@ def _request_user_info(role_id, token, account, key_type=KEY_TYPE_ROLE, timeout=
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
+        with net_keepalive.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -1098,7 +1100,7 @@ def _request_log_page(role_id, start_date, end_date, page, token, account):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with net_keepalive.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -1533,7 +1535,7 @@ class QueryResult:
 
 def run_query(role_ids, token=None, account=None, on_progress=None,
               key_type=KEY_TYPE_ROLE, id_label="角色ID", should_stop=None,
-              workers=BATCH_CONCURRENCY, on_item=None):
+              workers=BATCH_CONCURRENCY, on_item=None, on_user_info=None):
     """批量查询一组角色ID / 无端ID，返回 QueryResult
 
     - token 为空时自动获取（缓存 / 浏览器 / 弹登录框）；查询中被判定登录态失效时
@@ -1541,6 +1543,8 @@ def run_query(role_ids, token=None, account=None, on_progress=None,
     - workers 为并发查询的账号数（默认 BATCH_CONCURRENCY=4），设为 1 即逐个串行查询
     - should_stop 为可选回调，返回 True 时停止后续未开始的账号（已发出的请求仍会返回）
     - on_item(done, total) 为可选回调：每查完一个编号调用一次（进度条用，可能在工作线程中调用）
+    - on_user_info(raw, info) 为可选回调：每取到一个编号的角色信息就调用一次。
+      查无端ID 时 info["role_id"] 就是换算出来的角色ID，联合查询靠它省掉整轮换算请求
     - 单个账号失败不影响其他账号；登录态类错误则中止整批
     """
     def note(msg):
@@ -1605,7 +1609,15 @@ def run_query(role_ids, token=None, account=None, on_progress=None,
             raise
         except Exception as e:                     # 理论上不会走到（接口异常已在上面降级）
             note(f"[警告] {id_label} {rid} 角色名获取失败（不影响封禁状态判定）：{e}")
-            info = {"role_name": STATUS_TEXT_ROLE_FAILED, "wd_id": "", "state": "failed"}
+            info = {"role_name": STATUS_TEXT_ROLE_FAILED, "wd_id": "", "role_id": "",
+                    "state": "failed"}
+        # 角色信息接口的返回里带 roleId——「无端ID → 角色ID」换算要的就是它。
+        # 这里顺手把结果发布出去，调用方（联合查询）就不必再单独发一轮同样的请求。
+        if on_user_info is not None:
+            try:
+                on_user_info(rid, info)
+            except Exception:                      # 回调异常不影响查询本身
+                pass
         try:
             items, _total = fetch_records_with_auth_retry(rid, box, key_type, note)
         except AuthAbortError:

@@ -1666,6 +1666,9 @@ def resolve_wuduan_role_ids(wuduan_ids, box, log, should_stop=None, workers=None
     已被停止），调用方应让该编号跳过 ACE，而不是拿无端ID 硬查。
 
     登录态失效（AuthAbortError）向上抛出，由调用方决定是否中止整批。
+
+    注：run_joint 已不再调用它——换算改由 amis 查询顺带拿到 roleId（零额外请求），
+    这里保留作为独立工具函数（命令行 / 自检按批换算用）。
     """
     workers = max(1, int(workers or AMIS_WORKERS))
     out = {}
@@ -1695,6 +1698,62 @@ def resolve_wuduan_role_ids(wuduan_ids, box, log, should_stop=None, workers=None
     for raw, rid in pairs:
         out[raw] = rid
     return out
+
+
+class _AceConvertFeed(object):
+    """「无端ID → 角色ID」换算结果的发布/订阅（把换算并进 amis 查询）
+
+    amis 查询每个编号的第一个请求就是角色信息接口，返回里已经带 roleId —— 这正是
+    换算需要的全部信息。旧实现把这个字段丢掉，再单独并发跑一轮完全相同的请求做换算，
+    而且必须在两个平台开始之前跑完。改成「边查边发布、收到即查」后：
+
+    - 换算请求数降为 0（复用 amis 本就发出的请求）
+    - 串行前置消失：ACE 先查角色ID 编号，无端ID 换出一个查一个
+
+    - publish(raw, role_id)：amis 阶段调用；role_id 为空表示该编号没换出来
+    - finish()：amis 阶段结束（成功 / 失败 / 用户取消都要调），唤醒等待方
+    - take(raws, timeout)：返回 (ready, unresolved)
+        ready      {无端ID: 角色ID}，已能确定换算结果的
+        unresolved 已确认换不出来的（amis 阶段已结束，或接口明确说没这个角色）
+      未就绪且 amis 未结束时最多等 timeout 秒（等事件，不轮询空转）
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._map = {}
+        self._failed = set()
+        self._done = False
+
+    def publish(self, raw, role_id):
+        raw = str(raw or "")
+        if not raw:
+            return
+        rid = str(role_id or "").strip()
+        with self._cond:
+            if rid:
+                self._map[raw] = rid
+            else:
+                self._failed.add(raw)
+            self._cond.notify_all()
+
+    def finish(self):
+        with self._cond:
+            self._done = True
+            self._cond.notify_all()
+
+    def take(self, raws, timeout=0.5):
+        raws = [str(r) for r in raws]
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while True:
+                ready = {r: self._map[r] for r in raws if r in self._map}
+                unresolved = [r for r in raws
+                              if r not in self._map and (r in self._failed or self._done)]
+                pending = [r for r in raws if r not in self._map and r not in self._failed]
+                left = deadline - time.monotonic()
+                if ready or unresolved or not pending or left <= 0:
+                    return ready, unresolved
+                self._cond.wait(left)
 
 
 # ---------------------------------------------------------------- 联合查询主流程
@@ -1783,46 +1842,32 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
             amis_login_error = format_error(exc)
             log("[amis] 登录未完成：%s" % amis_login_error)
 
-    # ---- 4) 无端ID → 角色ID 换算（ACE 的 OpenID 只认角色ID，无端ID 查不到数据） ----
+    # ---- 4) ACE 待查清单：角色ID 直接查；无端ID 的换算并进 amis 查询（边查边发布）----
+    #
+    # 换算需要的信息就是 amis 查询每个编号时第一个请求（角色信息接口）返回里的
+    # roleId。原实现把它丢掉、再单独并发跑一轮同样的请求，而且这一轮必须在两个平台
+    # 开始之前全部跑完（N 个无端ID ≈ N/并发 个网络往返的串行前置）。现在改成
+    # amis 阶段查到即发布、ACE 阶段收到即查：换算请求数降为 0，前置等待也一并消失。
+    role_items = [it for it in queried if it.amis_kind == KIND_ROLE]
     wuduan_items = [it for it in queried if it.amis_kind == KIND_WUDUAN]
-    if wuduan_items:
-        if amis_login_error:
-            log("[换算] %d 个无端ID 需先换算角色ID 才能查 ACE，但 amis 登录未完成，"
-                "这些编号本次跳过 ACE。" % len(wuduan_items))
-            for it in wuduan_items:
-                it.ace_openid = None
-                it.note = "%s；未能换算出角色ID（amis 登录未完成），已跳过 ACE" % it.note
-        else:
-            snap = amis_local_snapshot()
-            box = amis_query.TokenBox(snap.get("token") or "", snap.get("account") or "")
-            log("[换算] %d 个无端ID 正在换算角色ID（ACE 只认角色ID）…" % len(wuduan_items))
-            try:
-                mapping = resolve_wuduan_role_ids(
-                    [it.raw for it in wuduan_items], box, log,
-                    should_stop=should_stop, workers=amis_worker_count)
-            except Exception as exc:
-                mapping = {}
-                log("[换算] 换算中断：%s（相关编号本次跳过 ACE）" % format_error(exc))
-            ok = 0
-            for it in wuduan_items:
-                rid = str(mapping.get(it.raw) or "").strip()
-                if rid:
-                    it.ace_openid = rid
-                    it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
-                    result.ace_converted[it.raw] = rid
-                    ok += 1
-                    log("[换算] 无端ID %s → 角色ID %s（ACE 将用角色ID 查询）" % (it.raw, rid))
-                else:
-                    it.ace_openid = None
-                    it.note = "%s；未能换算出角色ID，已跳过 ACE" % it.note
-            log("[换算] 无端ID 换算完成：成功 %d / %d。" % (ok, len(wuduan_items)))
+    item_by_raw = {it.raw: it for it in queried}
+    wuduan_raw_set = set(it.raw for it in wuduan_items)
+    ace_resolved = set()                   # 成功换算出角色ID 的无端ID（收尾判定用）
+    feed = _AceConvertFeed()
 
-    # ---- 5) ACE 待查清单（换算后确定：角色ID 用自身，无端ID 用换算出的角色ID） ----
-    ace_openids = []
-    for it in queried:
-        if it.ace_openid and it.ace_openid not in ace_openids:
-            ace_openids.append(it.ace_openid)
-    result.ace_order = list(ace_openids)
+    # ACE OpenID → 编号（一个 OpenID 可能对应多个编号）：进度回填与结果映射都用它
+    ace_to_raws = {}
+    ace_map_lock = threading.Lock()
+
+    def register_ace_raw(openid, raw):
+        with ace_map_lock:
+            bucket = ace_to_raws.setdefault(str(openid), [])
+            if str(raw) not in bucket:
+                bucket.append(str(raw))
+
+    for it in role_items:
+        it.ace_openid = it.raw                 # 角色ID 自身即 OpenID
+        register_ace_raw(it.raw, it.raw)
 
     # ---- 6) 进度条：按「编号」计数（同一编号的 amis / ACE 都返回才算查完 1 个） ----
     tracker = JointProgress(items)
@@ -1835,11 +1880,10 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
         except Exception:
             pass
 
-    # ACE 回调回来的是「实际查询用的 OpenID」，需映射回编号（一个 OpenID 可能对应多个编号）
-    ace_to_raws = {}
-    for it in queried:
-        if it.ace_openid:
-            ace_to_raws.setdefault(str(it.ace_openid), []).append(it.raw)
+    # 参与过 ACE 的编号集合（建 tracker 时先记下：无端ID 此刻的 ace_openid 还是自身，
+    # 换算成功与否都不影响「这个编号有一条 ACE 子任务」这个事实）
+    ace_expected = set(it.raw for it in queried if getattr(it, "ace_openid", None))
+    ace_done_raws = set()
 
     def bump_progress(raw):
         """某个编号在某个平台上的查询完成（raw 为编号原文）"""
@@ -1847,19 +1891,37 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
             report_progress()
 
     def bump_ace_progress(openid):
-        """ACE 某 OpenID 查询完成 → 通知它对应的编号（通常 1 个）"""
-        for raw in ace_to_raws.get(str(openid), ()):
+        """ACE 某 OpenID 查询完成 → 通知它对应的编号（一个 OpenID 可能对应多个编号）"""
+        with ace_map_lock:
+            raws = list(ace_to_raws.get(str(openid), ()))
+        for raw in raws:
+            ace_done_raws.add(raw)
             bump_progress(raw)
-
-    # ---- 7) 编号识别表（备注含「无端ID → 角色ID」换算说明） ----
-    for it in items:
-        result.ident_rows.append(it.as_row())
 
     # 进度条总数 = 参与查询的编号数（每个编号的 amis / ACE 两条线都算它的子任务）
     report_progress("准备查询")
 
     # ---- 平台一：amis（登录封禁） ----
     def run_amis_phase():
+        """amis 阶段：查封禁记录的同时，把角色信息里的 roleId 发布给 ACE 阶段
+
+        发布是完全免费的——那个角色信息请求本来就要发，只是返回里的 role_id
+        以前被丢掉了。ACE 阶段等的是这里的发布事件，不是「整个阶段结束」。
+        """
+        try:
+            _amis_phase()
+        finally:
+            feed.finish()                # 成功 / 失败 / 用户取消都要唤醒等待换算的 ACE 阶段
+
+    def on_amis_user_info(raw, info):
+        """角色信息回调：把 roleId 发布出去（无端ID 的 ACE 换算就靠它）"""
+        rid = str((info or {}).get("role_id") or "").strip()
+        feed.publish(raw, rid)
+        if rid and raw in wuduan_raw_set:
+            log("[换算] 无端ID %s → 角色ID %s（复用 amis 查询的角色信息，未额外请求）"
+                % (raw, rid))
+
+    def _amis_phase():
         if not groups_spec:
             if not result.amis_error:
                 log("[amis] 未识别到可查 amis 的编号，跳过 amis 平台。")
@@ -1883,7 +1945,8 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
                 res = amis_query.run_query(ids, key_type=key_type, id_label=label,
                                            on_progress=log, should_stop=should_stop,
                                            workers=amis_worker_count,
-                                           on_item=lambda _n, _t, rid: bump_progress(rid))
+                                           on_item=lambda _n, _t, rid: bump_progress(rid),
+                                           on_user_info=on_amis_user_info)
             except Exception as exc:                 # 登录取消 / 网络异常 → 整批失败
                 result.amis_error = format_error(exc)
                 if not merged_groups:
@@ -1899,14 +1962,15 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
             if result.stopped:
                 result.amis.stopped = True
 
-    # ---- 平台二：ACE（可疑用户核查 + 数据查询，OCR 编号并发） ----
+    # ---- 平台二：ACE（可疑用户核查 + 数据查询；角色ID 不等换算，无端ID 收到换算就查） ----
     def run_ace_phase():
-        if not ace_openids:
+        if not role_items and not wuduan_items:
             log("[ACE] 未识别到可查 ACE 的编号，跳过 ACE 平台。")
             return
         if stopping():
             result.stopped = True
-            log("[ACE] 已停止，跳过 ACE 平台全部 %d 个编号" % len(ace_openids))
+            log("[ACE] 已停止，跳过 ACE 平台全部 %d 个编号"
+                % (len(role_items) + len(wuduan_items)))
             return
         # 1) 本地凭据
         try:
@@ -1937,45 +2001,123 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
             log("[ACE] 用户取消登录，ACE 平台本次不查询。")
             return
 
-        # 3) 并发查询：账号之间并发，账号内部的核查 / 处罚 / 翻页也并发
-        pending = list(ace_openids)
-        for attempt in (1, 2):                       # 第 2 轮用于「登录态失效后换新凭据续跑」
-            if stopping():
-                result.stopped = True
-                break
-            got, pending, fail_reason = run_ace_batch(pending, cookies, log, stopping,
-                                                      ace_worker_count,
-                                                      on_item=lambda _n, _t, oid:
-                                                      bump_ace_progress(oid))
-            result.ace.update(got)
-            if not fail_reason:
-                break
-            log("[ACE] 登录态失效：%s" % fail_reason)
-            if ace_cookies_provider is None:
-                result.ace_error = fail_reason
-                break
-            if attempt == 2:
-                result.ace_error = fail_reason
-                log("[ACE] 重新登录后仍判定失效，已中止 ACE 查询。")
-                break
-            cookies = ask_ace_login(fail_reason)
-            if not cookies:
-                result.ace_error = "登录已取消：" + fail_reason
-                log("[ACE] 用户取消登录，ACE 剩余编号未查询。")
-                break
-            if not pending:
-                break
-            log("[ACE] 已取得新的登录态，继续查询剩余 %d 个编号…" % len(pending))
+        # 3) 并发查询：账号之间并发，账号内部的核查 / 处罚 / 翻页也并发。
+        #    先查角色ID（不等换算）；无端ID 的 OpenID 由 amis 阶段边查边发布，
+        #    这里收到一批就跑一批——换算不再是「两个平台开始前的串行前置」。
+        attempted = set()                            # 已发起过查询的 OpenID（一个 OpenID 可能对应多个编号）
+        attempted_lock = threading.Lock()
 
+        def run_wave(openids, cookies):
+            """跑一批 OpenID（登录态失效时换新凭据重试一次）；返回 (cookies, fail_reason)"""
+            with attempted_lock:
+                pending = [o for o in openids if o and o not in attempted]
+                attempted.update(pending)
+            if not pending:
+                return cookies, ""
+            for attempt in (1, 2):                   # 第 2 轮用于「登录态失效后换新凭据续跑」
+                if stopping():
+                    result.stopped = True
+                    return cookies, ""
+                got, pending, fail_reason = run_ace_batch(
+                    pending, cookies, log, stopping, ace_worker_count,
+                    on_item=lambda _n, _t, oid: bump_ace_progress(oid))
+                result.ace.update(got)
+                if not fail_reason:
+                    return cookies, ""
+                log("[ACE] 登录态失效：%s" % fail_reason)
+                if ace_cookies_provider is None:
+                    return cookies, fail_reason
+                if attempt == 2:
+                    log("[ACE] 重新登录后仍判定失效，已中止 ACE 查询。")
+                    return cookies, fail_reason
+                cookies = ask_ace_login(fail_reason)
+                if not cookies:
+                    return cookies, "登录已取消：" + fail_reason
+                if not pending:
+                    return cookies, ""
+                log("[ACE] 已取得新的登录态，继续查询剩余 %d 个编号…" % len(pending))
+            return cookies, ""
+
+        convert_box = {"box": None}
+
+        def convert_one(raw):
+            """兜底换算：amis 阶段没给出 roleId 的编号，单独补查一次角色信息
+
+            只有 amis 阶段确实结束、该编号仍未换出角色ID 时才走到这里（通常是该编号
+            的角色信息接口返回「未找到」之类的异常），等价于旧实现的换算请求。
+            amis 登录本身没完成时直接放弃，不再白发请求。
+            """
+            if amis_login_error:
+                return ""
+            try:
+                if convert_box["box"] is None:
+                    snap = amis_local_snapshot()
+                    convert_box["box"] = amis_query.TokenBox(snap.get("token") or "",
+                                                             snap.get("account") or "")
+                info = amis_query.fetch_user_info_with_auth_retry(
+                    raw, convert_box["box"], amis_query.KEY_TYPE_WDID, log)
+            except Exception as exc:
+                log("[换算] 无端ID %s 补查角色ID 失败：%s" % (raw, format_error(exc)))
+                return ""
+            return str((info or {}).get("role_id") or "").strip()
+
+        cookies, fail_reason = run_wave([it.raw for it in role_items], cookies)
+
+        # 无端ID：等 amis 阶段发布换算结果（发布的都是 amis 查询顺带拿到的，零额外请求）
+        remaining = {it.raw: it for it in wuduan_items}
+        while not fail_reason and remaining and not stopping():
+            ready, unresolved = feed.take(list(remaining), timeout=0.5)
+            if not ready and not unresolved:
+                continue                             # amis 还没查到 / 还没结束，继续等
+            fresh = []
+            for raw, rid in list(ready.items()):
+                it = remaining.pop(raw, None)
+                if it is None:
+                    continue
+                rid = str(rid)
+                it.ace_openid = rid
+                it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
+                result.ace_converted[raw] = rid
+                ace_resolved.add(raw)
+                register_ace_raw(rid, raw)
+                fresh.append(rid)
+            for raw in list(unresolved):
+                it = remaining.pop(raw, None)
+                if it is None:
+                    continue
+                rid = convert_one(raw)
+                if rid:
+                    it.ace_openid = rid
+                    it.note = "%s；ACE 实际查询角色ID %s" % (it.note, rid)
+                    result.ace_converted[raw] = rid
+                    ace_resolved.add(raw)
+                    register_ace_raw(rid, raw)
+                    log("[换算] 无端ID %s → 角色ID %s（amis 未返回，已单独补查）" % (raw, rid))
+                    fresh.append(rid)
+                else:
+                    it.ace_openid = None
+                    it.note = "%s；未能换算出角色ID（%s），已跳过 ACE" % (
+                        it.note, "amis 登录未完成" if amis_login_error else "接口未返回角色ID")
+                    log("[换算] 无端ID %s 未能换算出角色ID，本次跳过 ACE" % raw)
+                    bump_progress(raw)               # ACE 子任务按「跳过」计入完成，进度条不卡住
+            if fresh:
+                cookies, fail_reason = run_wave(fresh, cookies)
+
+        if fail_reason:
+            result.ace_error = fail_reason
         if stopping():
             result.stopped = True
-            log("[ACE] 已停止：完成 %d / %d 个" % (len(result.ace), len(ace_openids)))
-        elif pending and not result.ace_error:
-            log("[ACE] 完成 %d / %d 个编号。" % (len(result.ace), len(ace_openids)))
+            log("[ACE] 已停止：完成 %d / %d 个" % (len(result.ace), len(attempted)))
+        elif not fail_reason:
+            log("[ACE] 完成 %d / %d 个编号%s。"
+                % (len(result.ace), len(attempted),
+                   ("（%d 个无端ID 未换算出角色ID）" % len(remaining)) if remaining else ""))
 
     # ---- 3) 两个平台同时查询（互不等待）；只有一个平台有编号时直接串行跑 ----
+    if not groups_spec:
+        feed.finish()                        # 没有 amis 阶段 → 不会有换算发布，直接唤醒等待方
     phases = [fn for fn, needed in ((run_amis_phase, bool(groups_spec)),
-                                    (run_ace_phase, bool(ace_openids))) if needed]
+                                    (run_ace_phase, bool(role_items or wuduan_items))) if needed]
     if not phases:
         log("[提示] 本次没有可查询的编号（amis / ACE 均无）。")
     elif len(phases) == 1 or not PARALLEL_PLATFORMS:
@@ -1997,6 +2139,30 @@ def run_joint(items, on_log=None, should_stop=None, ace_cookies_provider=None,
     # ---- 收尾：只要用户点过「停止」，本次结果就标记为已停止（UI 显示「已停止」而非「完成」）----
     if stopping():
         result.stopped = True
+
+    # ---- 收尾：没换出角色ID 的无端ID（amis 登录未完成 / ACE 整体未查询）明确标记跳过 ----
+    for it in wuduan_items:
+        if it.raw not in ace_resolved:
+            it.ace_openid = None
+            if "已跳过 ACE" not in it.note:
+                it.note = "%s；未能换算出角色ID（%s），已跳过 ACE" % (
+                    it.note, "amis 登录未完成" if amis_login_error else "ACE 平台本次未查询")
+
+    # ---- 收尾：进度条补齐 ----
+    # ACE 平台整体跳过（凭据不可用 / 用户取消）、换算失败、中途停止时，那些子任务不会有
+    # 回调，这里统一计入完成，否则进度条永远停在半路（ACE 页签的提示文案已说明原因）
+    for raw in ace_expected - ace_done_raws:
+        bump_progress(raw)
+
+    # ---- 收尾：编号识别表（备注含「无端ID → 角色ID」换算说明，放在查询结束后生成） ----
+    for it in items:
+        result.ident_rows.append(it.as_row())
+
+    # ---- 收尾：ACE 汇总顺序（按编号顺序去重，界面「ACE 可疑/处罚」页签与导出都按它） ----
+    result.ace_order = []
+    for it in queried:
+        if it.ace_openid and it.ace_openid not in result.ace_order:
+            result.ace_order.append(it.ace_openid)
 
     return result
 
@@ -4267,6 +4433,119 @@ def _check_resultview(check, warn):
         warn("结果区全部居中显示", "打包版没有 .py 源码，跳过该源码级检查")
 
 
+def _check_speedup(check, warn):
+    """自检两项提速改动：HTTP 连接复用 + 「无端ID 换算」并进 amis 查询
+
+    ① 连接复用：本地起一个 http.server 做真实往返（不联网），断言「3 次请求只建 1 条
+       连接」；再用字节码里的全局名引用确认两个业务模块的请求确实走了 net_keepalive
+       ——打包成 exe 后没有 .py 源码，源码级检查会失效，只能这么查。
+    ② 换算流水线：验证「发布/订阅」语义；端到端断言放在自检主体的假链路用例里
+       （断言「换算零额外请求」）。
+    """
+    import urllib.request as _urlreq
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    try:
+        import net_keepalive as _ka
+    except Exception as exc:
+        check("HTTP 连接复用（keep-alive）", False, "net_keepalive 导入失败：%s" % exc)
+        return
+
+    class _Echo(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        conns = [0]
+
+        def log_message(self, *args):
+            pass
+
+        def setup(self):
+            _Echo.conns[0] += 1
+            BaseHTTPRequestHandler.setup(self)
+
+        def do_GET(self):
+            body = b'{"ok":1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = None
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Echo)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        _ka.reset_stats()
+        for i in range(3):
+            req = _urlreq.Request("http://127.0.0.1:%d/p%d" % (port, i))
+            with _ka.urlopen(req, timeout=5, force=True) as resp:
+                assert resp.status == 200 and resp.read() == b'{"ok":1}'
+        st = _ka.stats()
+        check("HTTP 连接复用（keep-alive）",
+              _Echo.conns[0] == 1 and st["new"] == 1 and st["reused"] == 2,
+              "3 次请求只建 %d 条连接（复用 %d 次，即省下 %d 次 TCP/TLS 握手）"
+              % (_Echo.conns[0], st["reused"], st["reused"]))
+    except Exception as exc:
+        check("HTTP 连接复用（keep-alive）", False, "本地往返失败：%s" % exc)
+    finally:
+        if srv is not None:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
+
+    _ka_users = [("amis 角色信息", getattr(amis_query, "_request_user_info", None)),
+                 ("amis 封禁记录", getattr(amis_query, "_request_forbid_page", None)),
+                 ("amis 解禁日志", getattr(amis_query, "_request_log_page", None)),
+                 ("ACE 接口", getattr(ace_query, "_post_json", None)),
+                 ("ACE 截图下载", getattr(ace_query, "download_image", None))]
+    missing = [name for name, fn in _ka_users
+               if fn is None or "net_keepalive" not in (fn.__code__.co_names or ())]
+    check("amis / ACE 请求全部走 keep-alive", not missing,
+          "5 处请求已接入长连接" if not missing else "未接入：%s" % "、".join(missing))
+
+    # 代理路由：走系统代理（很常见）时也要能复用连接，且代理怪异时回落 urllib
+    _saved_proxies = _urlreq.getproxies
+    _saved_bypass = _urlreq.proxy_bypass
+    try:
+        _urlreq.getproxies = lambda: {}
+        _urlreq.proxy_bypass = lambda _h: False
+        _direct = _ka._proxy_route("amis.ssjj.cn", "https") is None
+        _urlreq.getproxies = lambda: {"https": "http://127.0.0.1:7890"}
+        _via = _ka._proxy_route("amis.ssjj.cn", "https")
+        _urlreq.proxy_bypass = lambda _h: True
+        _bypassed = _ka._proxy_route("amis.ssjj.cn", "https") is None
+        _urlreq.proxy_bypass = lambda _h: False
+        _urlreq.getproxies = lambda: {"https": "socks5://127.0.0.1:1080"}
+        _socks = _ka._proxy_route("amis.ssjj.cn", "https") is _ka._FALLBACK
+        _tunnel = _ka._new_conn(("proxy", "127.0.0.1", 7890, None, "https",
+                                 "amis.ssjj.cn", 443), 5)
+        _tunnel_ok = (_tunnel.host == "127.0.0.1" and _tunnel._tunnel_host == "amis.ssjj.cn")
+        _tunnel.close()
+    except Exception as exc:
+        _direct = _via = _bypassed = _socks = _tunnel_ok = False
+        warn("代理路由（直连 / 代理 / 绕过 / 隧道）", "检查异常：%s" % exc)
+    finally:
+        _urlreq.getproxies = _saved_proxies
+        _urlreq.proxy_bypass = _saved_bypass
+    check("代理路由（直连 / 代理 / 绕过 / 隧道）",
+          _direct and _via == ("127.0.0.1", 7890, None) and _bypassed and _socks and _tunnel_ok,
+          "无代理→直连；系统代理→CONNECT 隧道（同样复用）；绕过列表→直连；"
+          "不支持的代理（socks 等）→交回 urllib")
+
+    feed = _AceConvertFeed()
+    feed.publish("w1", "r1")
+    ready, unresolved = feed.take(["w1", "w2"], timeout=0.01)
+    feed.publish("w2", "")
+    feed.finish()
+    ready2, unresolved2 = feed.take(["w2", "w3"], timeout=0.01)
+    check("换算结果边查边发布（发布/订阅语义）",
+          ready == {"w1": "r1"} and unresolved == []
+          and ready2 == {} and unresolved2 == ["w2", "w3"],
+          "发布即可取用；未发布且 amis 未结束时不误判失败、也不空转；"
+          "amis 结束后仍未发布的按「换不出来」返回（交给兜底补查 / 跳过）")
+
+
 def selfcheck():
     """离线自检：模块接口、编号识别、结果渲染与 CSV 导出逻辑（不联网）"""
     ok = True
@@ -4310,6 +4589,7 @@ def selfcheck():
           "ACE 账号并发 %d / 翻页并发 %d / 在途总闸 %d，amis 并发 %d，两平台并行 %s"
           % (ACE_ACCOUNT_WORKERS, ACE_PAGE_WORKERS, ACE_INFLIGHT_LIMIT,
              AMIS_WORKERS, "开" if PARALLEL_PLATFORMS else "关"))
+    _check_speedup(check, warn)
     _pbar = globals().get("MProgress" + "Bar")
     check("批量进度条可用",
           callable(_pbar) and all(hasattr(_pbar, n) for n in
@@ -4483,13 +4763,15 @@ def selfcheck():
           "经角色信息接口（key=%s）换算：成功 1 / 未取到 1（未取到的编号跳过 ACE）"
           % amis_query.KEY_TYPE_WDID)
 
-    # ---- 端到端（假链路）：输入无端ID 时 ACE 必须用「换算出的角色ID」查询 ----
+    # ---- 端到端（假链路）：输入无端ID 时 ACE 用「换算出的角色ID」查询，
+    #      且换算复用 amis 查询的角色信息（零额外请求） ----
     _saved = {n: _g[n] for n in ("preflight_amis_login", "amis_local_snapshot",
                                  "probe_ace_online")}
     _saved_parts = (_g["ace_check_part"], _g["ace_punish_part"])
     _saved_run_query = amis_query.run_query
     _saved_fetch_info = amis_query.fetch_user_info_with_auth_retry
     _ace_asked = []
+    _convert_calls = []
 
     def _fake_check(oid, cookies, log_fn=None, should_stop=None):
         _ace_asked.append(oid)
@@ -4502,10 +4784,26 @@ def selfcheck():
     _g["ace_check_part"] = _fake_check
     _g["ace_punish_part"] = lambda oid, cookies, log_fn=None, should_stop=None: {
         "punish_items": [], "punish_count": 0, "punish_error": ""}
-    amis_query.run_query = lambda ids, **kw: amis_query.QueryResult(
-        [], [], token_source="自检", id_label=kw.get("id_label", "编号"), total_ids=len(ids))
-    amis_query.fetch_user_info_with_auth_retry = lambda rid, box, key_type, note: {
-        "role_name": "自检角色", "wd_id": rid, "role_id": "7654321", "state": "ok"}
+
+    def _fake_run_query(ids, **kw):
+        """假 amis 查询：像真的一样逐个把角色信息（含 roleId）发布给 ACE 阶段"""
+        on_user_info, on_item = kw.get("on_user_info"), kw.get("on_item")
+        for i, rid in enumerate(ids):
+            if on_user_info:
+                on_user_info(rid, {"role_name": "自检角色", "wd_id": rid,
+                                   "role_id": "7654321", "state": "ok"})
+            if on_item:
+                on_item(i + 1, len(ids), rid)
+        return amis_query.QueryResult([], [], token_source="自检",
+                                      id_label=kw.get("id_label", "编号"),
+                                      total_ids=len(ids))
+
+    amis_query.run_query = _fake_run_query
+
+    def _fake_fetch_info(rid, box, key_type, note):
+        _convert_calls.append(rid)                   # 兜底换算请求：这里应为 0 次
+        return {"role_name": "自检角色", "wd_id": rid, "role_id": "7654321", "state": "ok"}
+    amis_query.fetch_user_info_with_auth_retry = _fake_fetch_info
     try:
         _wd_items = build_ident_items("10000000000001", MODE_AUTO)[0]
         _wd_res = run_joint(_wd_items, on_log=lambda _m: None,
@@ -4522,6 +4820,9 @@ def selfcheck():
           and "7654321" in _wd_res.items[0].note,
           "输入无端ID 10000000000001 → ACE 实际查询的角色ID 为 %s"
           % (_ace_asked[0] if _ace_asked else "未查询"))
+    check("换算复用 amis 角色信息（零额外请求）", not _convert_calls,
+          "换算不再单独发请求：额外请求 %d 次（旧实现每换一个编号多 1 次，"
+          "且必须在两个平台开始前全部跑完）" % len(_convert_calls))
     _prog_items = build_ident_items("123456, 234567, 12345678901234, abc", MODE_AUTO)[0]
     _prog = JointProgress(_prog_items)
     _snaps = []

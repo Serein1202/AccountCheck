@@ -23,6 +23,7 @@ ACE 控制台查询引擎（由 joint_query.py 调用，不再提供独立入口
 import base64
 import hashlib
 import json
+import net_keepalive
 import os
 import re
 import shutil
@@ -714,7 +715,8 @@ def _post_json(url, payload, trace_header, cookies, timeout=30):
     request = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # keep-alive：ACE 每个编号要发核查 + 处罚两个请求，复用连接省掉重复握手
+        with net_keepalive.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
             status = response.status
     except urllib.error.HTTPError as exc:
@@ -907,7 +909,8 @@ def download_image(url, cookies):
     }
     request = urllib.request.Request(url=url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        # 截图通常连着下载多张，keep-alive 在这里最划算
+        with net_keepalive.urlopen(request, timeout=30) as response:
             raw = response.read()
             content_type = response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
