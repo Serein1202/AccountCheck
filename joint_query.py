@@ -160,6 +160,7 @@ PLATFORM_LABEL = {PLATFORM_AMIS: "amis", PLATFORM_ACE: "ACE"}
 # 登录态探测：仅用于轻量只读请求，不会产生业务数据
 ACE_PROBE_OPENID = "0"
 AMIS_PROBE_KEYWORD = "99999999999999"
+ACE_PROBE_DAYS = 1               # ACE 探活只看「当天」这一个时间窗（见 probe_ace_online）
 PROBE_TIMEOUT = 12               # 探测请求的超时（秒）：比业务请求短得多——
                                  # 探测只需要「通 / 不通」的结论，卡 30s 只会让芯片一直「检测中」
 
@@ -1137,13 +1138,29 @@ def probe_amis_online(token, account="", timeout=None):
         return "unknown"
 
 
+def ace_probe_range():
+    """ACE 探活的时间窗：只取当天（不要用 dq_time_range 的 10 年全量）
+
+    探活要回答的问题只有一个——「这份凭据接口认不认」。凭据无效时服务端在任何
+    时间窗下都会返回鉴权错误，所以窗口开多大都不改变结论，却直接决定耗时：实测
+    同一个探活请求，拉 10 年全量要 6.9 秒，只看当天只要 0.5 秒（服务端按时间窗
+    扫库，探活用的那个不存在的 OpenID 无法被短路优化）。
+    探活是每次查询都要付的固定前置开销，一次查询 16 秒里它独占 7 秒，改窄即省。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    return ace_query.resolve_dq_dates(today, today)
+
+
 def probe_ace_online(cookies, timeout=None):
-    """在线轻量校验 ACE 登录态：valid / invalid / unknown（查询一个不存在的 OpenID）"""
+    """在线轻量校验 ACE 登录态：valid / invalid / unknown（查询一个不存在的 OpenID）
+
+    时间窗只开当天（见 ace_probe_range）：探活求「快」，不求「全」。
+    """
     if not cookies:
         return "missing"
     timeout = timeout or PROBE_TIMEOUT
     try:
-        begin, end = ace_query.dq_time_range()
+        begin, end = ace_probe_range()
         ace_query.query_punish(ACE_PROBE_OPENID, 1, 1, cookies, begin, end,
                                timeout=timeout)
         return "valid"
@@ -4573,6 +4590,32 @@ def _check_speedup(check, warn):
           and ready2 == {} and unresolved2 == ["w2", "w3"],
           "发布即可取用；未发布且 amis 未结束时不误判失败、也不空转；"
           "amis 结束后仍未发布的按「换不出来」返回（交给兜底补查 / 跳过）")
+
+    # 探活时间窗：必须只开当天。凭据无效时任何窗口都会返回鉴权错误，所以窗口
+    # 只影响耗时——10 年全量实测 6.9s、当天 0.5s，而这 6.5s 是每次查询的固定白等。
+    _cap = {}
+    _real_punish = ace_query.query_punish
+
+    def _cap_punish(openid, page, page_size, cookies,
+                    begin_time=None, end_time=None, timeout=None):
+        _cap.update(openid=openid, begin=begin_time, end=end_time)
+        return 0, []
+
+    ace_query.query_punish = _cap_punish
+    try:
+        _verdict = probe_ace_online({"user_token": "x"})
+    finally:
+        ace_query.query_punish = _real_punish
+    try:
+        _span = (datetime.strptime(_cap["end"], "%Y-%m-%d %H:%M:%S")
+                 - datetime.strptime(_cap["begin"], "%Y-%m-%d %H:%M:%S")).days
+    except Exception:
+        _span = 9999
+    check("ACE 探活只开当天时间窗（不拉 10 年全量）",
+          _verdict == "valid" and _span < ACE_PROBE_DAYS + 1,
+          "探活 openid=%s，时间窗 %s ~ %s（跨度 %s 天）：探活只判定「凭据认不认」，"
+          "开满 10 年只会让每次查询白等约 6.5 秒"
+          % (_cap.get("openid"), _cap.get("begin"), _cap.get("end"), _span))
 
 
 def selfcheck():
