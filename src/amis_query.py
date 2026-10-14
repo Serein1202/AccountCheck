@@ -2577,7 +2577,7 @@ def build_table(parent, columns, headers, widths, stretch=(), style_name="Ban.Tr
 class ResultTextView(tk.Frame):
     """结果文本视图：一条记录一行，替代 Treeview——文字可直接拖动选择
 
-    用 tk.Text 的像素制表位对齐各列（默认居中，观感与原表格一致）：
+    用 tk.Text 的像素制表位对齐各列（左对齐，列首固定像素位置）：
     - 鼠标拖动就是原生文字选区，想选哪段选哪段，Ctrl+C 直接复制所选
       （列间是制表符，粘进 Excel/WPS 仍可自动分列）
     - 右键菜单：复制 / 复制整行 / 全选
@@ -2589,13 +2589,12 @@ class ResultTextView(tk.Frame):
     HEADER_LINES = 2                          # 表头行 + 分隔线
 
     def __init__(self, master, headers, widths, font=None, bg=CLR_CARD,
-                 on_double=None, center=True):
+                 on_double=None):
         super().__init__(master, bg=bg)
         self.headers = [str(h) for h in headers]
         self._widths = [max(40, int(w)) for w in widths]
         self._rows = []
         self.on_double = on_double
-        self._center = center
         self._bg = bg
         self._font = font or (FONT_UI, 10)
 
@@ -2641,14 +2640,16 @@ class ResultTextView(tk.Frame):
 
     # ---- 布局 ----
     def _tabstops(self):
-        """按列宽累计出像素制表位；居中模式停在每列中点，与原表格观感一致"""
+        """按列宽累计出像素制表位（左对齐，每列留 12px 间隙）
+
+        注意：Tk 制表位的对齐写法是 {像素 center}；"30c" 会被当成
+        **30 厘米**（c 是距离单位后缀），初版因此把列全排到了几千像素外。
+        """
         stops, x = [], 0
-        for w in self._widths:
-            x += w
-            stops.append(x - w / 2.0 if self._center else x)
-        if self._center:
-            return tuple("%dc" % round(s) for s in stops)
-        return tuple(int(s) for s in stops)
+        for w in self._widths[:-1]:
+            x += w + 12
+            stops.append(x)
+        return tuple(stops)
 
     # ---- 数据 ----
     @staticmethod
