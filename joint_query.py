@@ -2196,7 +2196,8 @@ class AceLoginDialog(object):
 # ==================================================================
 # 「数据查询」表格列宽（取自 ace_query.DQ_COLUMNS）
 ACE_DQ_WIDTHS = tuple(col[2] for col in ace_query.DQ_COLUMNS)
-# 「可疑用户核查」列宽（按字段名索引，避免与 ace_query.COLUMNS 的顺序耦合）
+ACE_DQ_STRETCH = tuple(col[1] for col in ace_query.DQ_COLUMNS if col[4])
+# 「可疑用户核查」表格列宽（按字段名索引，避免与 ace_query.COLUMNS 的顺序耦合）
 ACE_RECORD_WIDTHS = {
     "log_date": 140, "openid": 170, "data_type": 110, "key": 170, "des": 430,
     "level": 110, "ban_duration": 110, "bot_name": 190, "log_time": 190,
@@ -2207,7 +2208,12 @@ REC_HIDDEN_FIELDS = ("key", "ban_duration", "bot_name")
 REC_DISPLAY_FIELDS = tuple(c[1] for c in ace_query.COLUMNS
                            if c[1] not in REC_HIDDEN_FIELDS)
 
-REC_DES_FIELD = "des"             # 「路径/描述」字段名（截图地址就在这一列）
+# 可疑用户核查表格：含截图的记录在「路径/描述」列直接显示缩略图（点击看大图）
+REC_STYLE = "AceRec.Treeview"     # 专用 ttk 样式（行高比普通表格高，容纳缩略图）
+REC_ROW_HEIGHT = 76               # 行高（像素）：略大于缩略图高度，留出上下留白
+REC_THUMB_SIZE = (150, 64)        # 缩略图最大尺寸（宽, 高），等比缩放
+REC_THUMB_CANVAS_H = 68           # 缩略图画布高（略小于行高 76，避免撑行）
+REC_DES_FIELD = "des"             # 提到 tree 列（#0）承载缩略图的字段
 # 「路径/描述」表头（在 ace_query.COLUMNS 中按字段名取，缺失时用默认值）
 REC_DES_HEADER = next((c[0] for c in ace_query.COLUMNS if c[1] == REC_DES_FIELD), "路径/描述")
 
@@ -2284,173 +2290,12 @@ class AceImageDialog(tk.Toplevel):
             messagebox.showerror("打开失败", format_error(exc), parent=self)
 
 
-class ShotStrip(tk.Frame):
-    """截图缩略图带：横向排列 + 横向滚动，单击缩略图看大图
-
-    核查明细改成 ResultTextView 之后，单元格里放不了图片（图片是 ttk.Treeview
-    独有的能力）。截图因此集中放在明细下方这条带子里——仍与明细同屏、按记录
-    顺序排列并标注对应行号，既不额外占一列，也不用新开页签。
-
-    - add(seq, rec, url) 追加一格，seq 为对应记录的行号（与上方明细对齐）
-    - set_photo(i, photo) / set_text(i, text) 由主线程在下载完成后调用
-    - 单击 → on_open(i)；右键 → 复制图片 / 浏览器打开原图
-    """
-
-    THUMB = (150, 84)          # 缩略图最大尺寸（等比缩放）
-    CELL_H = 118               # 单格高度：序号行 + 缩略图 + 留白
-
-    def __init__(self, master, bg, on_open=None, on_browser=None, on_copy=None,
-                 tip="单击缩略图看大图，右键可复制图片"):
-        super().__init__(master, bg=bg)
-        self._bg = bg
-        self._on_open = on_open
-        self._on_browser = on_browser
-        self._on_copy = on_copy
-        self._items = []                       # [{"rec":..,"url":..,"raw":..,"photo":..}]
-        self._blank = None                     # 占位透明图：让每格尺寸在加载前就固定
-
-        head = tk.Frame(self, bg=bg)
-        head.pack(fill="x")
-        tk.Label(head, text="截图", font=(amis_query.FONT_UI, 9, "bold"),
-                 bg=bg, fg=amis_query.CLR_SUB).pack(side="left")
-        tk.Label(head, text="#行号对应上方明细    ·    " + tip,
-                 font=(amis_query.FONT_UI, 9), bg=bg,
-                 fg=amis_query.CLR_MUTED).pack(side="left", padx=(8, 0))
-
-        body = tk.Frame(self, bg=bg)
-        body.pack(fill="x", pady=(4, 0))
-        self.canvas = tk.Canvas(body, bg=amis_query.CLR_HEAD, highlightthickness=0,
-                                bd=0, height=self.CELL_H)
-        self.xsb = amis_query.MScrollbar(body, target=self.canvas,
-                                         orient="horizontal", thickness=14, bg=bg)
-        self.canvas.configure(xscrollcommand=self.xsb.set)
-        body.grid_columnconfigure(0, weight=1)
-        self.canvas.grid(row=0, column=0, sticky="ew")
-        self.xsb.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-
-        self.inner = tk.Frame(self.canvas, bg=amis_query.CLR_HEAD)
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", self._sync)
-        self.canvas.bind("<Configure>", self._sync)
-        self._bind_wheel(self.canvas)          # 指针在空白处也能横滚
-
-    # ---- 布局 ----
-    def _sync(self, _event=None):
-        """内容变化后刷新滚动区域，并把画布高度贴到内容高度（不出现纵向空白）"""
-        try:
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-            need = max(self.inner.winfo_reqheight(), self.THUMB[1] + 34)
-            if int(self.canvas.cget("height")) != need:
-                self.canvas.configure(height=need)
-        except Exception:
-            pass
-
-    def _on_wheel(self, event):
-        """滚轮 / Shift+滚轮 一律横滚（这条带子只有横向可滚）"""
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta:
-            self.canvas.xview_scroll(-1 if delta > 0 else 1, "units")
-        return "break"
-
-    def _bind_wheel(self, widget):
-        try:
-            widget.bind("<MouseWheel>", self._on_wheel)
-            widget.bind("<Shift-MouseWheel>", self._on_wheel)
-        except Exception:
-            pass
-        for child in widget.winfo_children():
-            self._bind_wheel(child)
-
-    # ---- 数据 ----
-    def item(self, i):
-        return self._items[i] if 0 <= i < len(self._items) else None
-
-    def add(self, seq, rec, url):
-        """追加一格，返回下标；seq 是记录行号（1 起），显示为「#行号」"""
-        if self._blank is None:
-            try:
-                self._blank = tk.PhotoImage(width=self.THUMB[0], height=self.THUMB[1])
-            except Exception:
-                self._blank = ""              # 极端情况下退化为纯文本标签
-        idx = len(self._items)
-        self._items.append({"rec": rec, "url": url, "raw": None, "photo": None,
-                            "lbl": None})
-
-        cell = tk.Frame(self.inner, bg=amis_query.CLR_HEAD)
-        cell.pack(side="left", padx=(0 if idx == 0 else 10, 0), pady=6)
-        tk.Label(cell, text="#%d" % seq, font=(amis_query.FONT_UI, 9),
-                 bg=amis_query.CLR_HEAD, fg=amis_query.CLR_SUB).pack(anchor="w")
-        lbl = tk.Label(cell, image=self._blank, text="加载中…", compound="center",
-                       font=(amis_query.FONT_UI, 9), bg=amis_query.CLR_CARD,
-                       fg=amis_query.CLR_MUTED, cursor="hand2", bd=0)
-        lbl.pack(anchor="w", pady=(2, 0))
-        self._items[idx]["lbl"] = lbl
-
-        lbl.bind("<Button-1>", lambda _e, i=idx: self._fire(self._on_open, i))
-        lbl.bind("<Button-3>", lambda e, i=idx: self._menu(e, i))
-        lbl.bind("<Button-2>", lambda e, i=idx: self._menu(e, i))   # macOS 习惯
-        self._bind_wheel(self.inner)
-        self._sync()
-        return idx
-
-    def set_photo(self, i, photo):
-        it = self.item(i)
-        if not it or it["lbl"] is None:
-            return
-        it["photo"] = photo                    # 保持引用，防止被 Tk 回收
-        try:
-            it["lbl"].configure(image=photo, text="")
-        except Exception:
-            pass
-        self._sync()
-
-    def set_text(self, i, text):
-        it = self.item(i)
-        if not it or it["lbl"] is None:
-            return
-        try:
-            it["lbl"].configure(image=self._blank, text=text)
-        except Exception:
-            pass
-
-    # ---- 交互 ----
-    def _fire(self, fn, i):
-        if fn:
-            try:
-                fn(i)
-            except Exception:
-                pass
-        return "break"
-
-    def _menu(self, event, i):
-        it = self.item(i)
-        menu = tk.Menu(self, tearoff=0, bg=amis_query.CLR_CARD,
-                       fg=amis_query.CLR_TEXT, activebackground=amis_query.CLR_PRIMARY,
-                       activeforeground=amis_query.CLR_ON_PRIMARY, bd=0, relief="flat",
-                       font=(amis_query.FONT_UI, 9))
-        menu.add_command(label="查看大图", command=lambda: self._fire(self._on_open, i))
-        if it and it.get("url"):
-            menu.add_command(label="复制图片",
-                             command=lambda: self._fire(self._on_copy, i))
-            menu.add_command(label="浏览器打开原图",
-                             command=lambda: self._fire(self._on_browser, i))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            try:
-                menu.grab_release()
-            except Exception:
-                pass
-        return "break"
-
-
 class AceDetailDialog(tk.Toplevel):
     """单个 OpenID 的 ACE 明细（两个页签）
 
-    两个页签都用 ResultTextView 纯文本视图渲染（与主结果区一致，可直接拖动
-    选字复制）：页签 1「可疑用户核查」展示关键列（证据Key / 处罚时长 / 外挂名
-    不展示），含截图的记录在页签下方的**截图缩略图带**里按行号排列、单击看
-    大图；页签 2「数据查询」展示处罚记录。
+    页签 1「可疑用户核查」：表格只展示关键列（证据Key / 处罚时长 / 外挂名不展示），
+    含截图的记录在「路径/描述」列直接显示缩略图，单击缩略图看大图（不单独开「截图」页签、
+    也不额外占一列）；页签 2「数据查询」：处罚记录表格。
     """
 
     def __init__(self, master, openid, data, cookies):
@@ -2458,7 +2303,11 @@ class AceDetailDialog(tk.Toplevel):
         self.openid = openid
         self.data = data or {}
         self.cookies = dict(cookies or {})
-        self._shot_raw = {}                     # {strip 下标: 原图字节} 供「复制图片」用
+        self._thumbs = {}                       # {iid: PhotoImage} 保持引用防回收
+        self._thumb_imgs = {}                   # {iid: PIL 缩略图} 供列宽变化时重渲染
+        self._thumb_after = None                # 重渲染去抖句柄
+        self._shot_rows = {}                    # {iid: {"rec":.., "url":.., "w":缩略图宽}}
+        self._shot_raw = {}                     # {iid: 原图字节} 供「复制图片」用
         self._ui_q = queue.Queue()              # 线程安全 UI 队列（worker 投递，主线程轮询执行）
         self.title("ACE 明细 · %s" % openid)
         self.configure(bg=amis_query.CLR_BG)
@@ -2472,8 +2321,7 @@ class AceDetailDialog(tk.Toplevel):
 
         records = self.data.get("records") or []
         punish = self.data.get("punish_items") or []
-        shots = [(n, r) for n, r in enumerate(records, 1)
-                 if str(r.get("data_type") or "") == "screenshot"]
+        shots = [r for r in records if str(r.get("data_type") or "") == "screenshot"]
 
         head = tk.Frame(self, bg=amis_query.CLR_BG)
         head.pack(fill="x", padx=18, pady=(14, 6))
@@ -2492,43 +2340,42 @@ class AceDetailDialog(tk.Toplevel):
                                  page_bg=amis_query.CLR_BG, font=(amis_query.FONT_UI, 10))
         nb.pack(fill="both", expand=True, padx=18, pady=(6, 6))
 
-        # 页签 1：可疑用户核查（纯文本视图 + 下方截图缩略图带）
+        # 页签 1：可疑用户核查（含截图的记录在「路径/描述」列直接显示缩略图）
         tab1 = tk.Frame(nb, bg=amis_query.CLR_BG)
         nb.add(tab1, text="可疑用户核查（%d）" % len(records))
-        rec_cols = ace_record_display_columns()
-        self.view_rec = amis_query.ResultTextView(
-            tab1, headers=[c[0] for c in rec_cols],
-            widths=[ACE_RECORD_WIDTHS.get(c[1], 140) for c in rec_cols],
-            font=(amis_query.FONT_UI, 10), bg=amis_query.CLR_BG,
-            aligns=["center"] * len(rec_cols))
-        if shots:
-            self.strip = ShotStrip(
-                tab1, bg=amis_query.CLR_BG, on_open=self._show_shot,
-                on_browser=self._browser_shot, on_copy=self._copy_shot)
-            # 缩略图带先从底部占位，再让明细填余下空间——顺序反过来会被
-            # Text 的请求高度顶出可视区
-            self.strip.pack(side="bottom", fill="x", padx=6, pady=(8, 6))
-            self.view_rec.pack(fill="both", expand=True, padx=6, pady=(6, 0))
-        else:
-            self.strip = None
-            self.view_rec.pack(fill="both", expand=True, padx=6, pady=6)
-        self.view_rec.set_rows([ace_record_display_row(rec) for rec in records])
+        wrap1 = tk.Frame(tab1, bg=amis_query.CLR_BG)
+        wrap1.pack(fill="both", expand=True, padx=6, pady=6)
+        self.tree_rec = self._build_record_table(wrap1, height=8)
+        for i, rec in enumerate(records):
+            des_text, other = self._record_row_parts(rec)
+            is_shot = str(rec.get("data_type") or "") == "screenshot"
+            url = ace_query.build_image_url(rec.get("des")) if is_shot else ""
+            if url and not HAS_PIL:
+                des_text = "查看原图（单击用浏览器打开）"
+            iid = self.tree_rec.insert("", "end", text=des_text, values=other,
+                                       tags=("odd" if i % 2 else "even",))
+            if not url:
+                continue
+            self._shot_rows[iid] = {"rec": rec, "url": url, "w": 0}
+            if HAS_PIL:                          # 缩略图后台加载，不阻塞窗口
+                threading.Thread(target=self._thumb_worker,
+                                 args=(iid, url, rec), daemon=True).start()
         if not records:
             tk.Label(tab1, text=self.data.get("check_error") or "该 OpenID 近 30 天无可疑用户核查记录",
                      bg=amis_query.CLR_BG, fg=amis_query.CLR_SUB).pack(pady=6)
-        for row_no, rec in shots:
-            self._add_shot(row_no, rec)
 
         # 页签 2：数据查询（处罚）
         tab2 = tk.Frame(nb, bg=amis_query.CLR_BG)
         nb.add(tab2, text="数据查询（%d）" % len(punish))
-        dq_cols = ace_query.DQ_COLUMNS
-        self.view_punish = amis_query.ResultTextView(
-            tab2, headers=[c[0] for c in dq_cols],
-            widths=list(ACE_DQ_WIDTHS), font=(amis_query.FONT_UI, 10),
-            bg=amis_query.CLR_BG, aligns=["center"] * len(dq_cols))
-        self.view_punish.pack(fill="both", expand=True, padx=6, pady=6)
-        self.view_punish.set_rows([ace_dq_row(item) for item in punish])
+        wrap2 = tk.Frame(tab2, bg=amis_query.CLR_BG)
+        wrap2.pack(fill="both", expand=True, padx=6, pady=6)
+        tree2 = amis_query.build_table(
+            wrap2, [c[1] for c in ace_query.DQ_COLUMNS], [c[0] for c in ace_query.DQ_COLUMNS],
+            ACE_DQ_WIDTHS, stretch=ACE_DQ_STRETCH, height=14, anchor="center")
+        amis_query.enable_copy(tree2, headers=[c[0] for c in ace_query.DQ_COLUMNS])
+        for i, item in enumerate(punish):
+            tree2.insert("", "end", values=ace_dq_row(item),
+                         tags=("odd" if i % 2 else "even",))
         if not punish:
             tk.Label(tab2, text=self.data.get("punish_error") or "该 OpenID 近 10 年无处罚记录",
                      bg=amis_query.CLR_BG, fg=amis_query.CLR_SUB).pack(pady=6)
@@ -2541,12 +2388,11 @@ class AceDetailDialog(tk.Toplevel):
         if not shots:
             tip = "本账号无可预览截图记录"
         elif not HAS_PIL:
-            tip = ("未安装 Pillow：截图请在下方缩略图带里单击后用浏览器打开原图"
-                   "（如需内置预览：pip install Pillow）")
+            tip = ("未安装 Pillow：含截图的记录请在「%s」列单击打开浏览器原图"
+                   "（如需内置预览：pip install Pillow）" % des_head)
         else:
-            tip = ("明细为纯文本视图，按住左键拖动即可直接选择文字，Ctrl+C 复制；"
-                   "「%s」列显示的是原始文字，含截图的记录在下方缩略图带里单击看大图"
-                   "（Esc 关闭）" % des_head)
+            tip = ("含截图的记录在「%s」列直接显示缩略图，单击缩略图查看大图；"
+                   "按住左键拖动可框选单元格区域，Ctrl+C 复制；单击缩略图看大图（Esc 关闭）" % des_head)
         tk.Label(foot, text=tip, bg=amis_query.CLR_BG, fg=amis_query.CLR_SUB,
                  font=(amis_query.FONT_UI, 9)).pack(side="left")
 
@@ -2563,90 +2409,209 @@ class AceDetailDialog(tk.Toplevel):
         except Exception:
             self.geometry("%dx%d" % (w, h))
 
-    # ---- 截图缩略图带（明细改文本视图后，图片集中放在这条带子里） ----
-    def _add_shot(self, row_no, rec):
-        """给缩略图带追加一格（row_no = 该记录在明细里的行号），并后台下载图片"""
-        if self.strip is None:
-            return
-        url = ace_query.build_image_url(rec.get("des"))
-        i = self.strip.add(row_no, rec, url)
+    # ---- 可疑用户核查表格（「路径/描述」列承载缩略图） ----
+    def _ensure_record_style(self):
+        """专用 ttk 样式：行高加大以容纳缩略图，其余配色与普通表格一致。"""
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+        st.configure(REC_STYLE, font=(amis_query.FONT_UI, 10), rowheight=REC_ROW_HEIGHT,
+                     borderwidth=0, background=amis_query.CLR_CARD,
+                     fieldbackground=amis_query.CLR_CARD, foreground=amis_query.CLR_TEXT)
+        st.layout(REC_STYLE, [("Treeview.treearea", {"sticky": "nswe"})])
+        st.map(REC_STYLE, background=[("selected", amis_query.CLR_SEL)],
+               foreground=[("selected", amis_query.CLR_ON_PRIMARY_CONTAINER)])
+        st.configure(REC_STYLE + ".Heading", font=(amis_query.FONT_UI, 9, "bold"),
+                     relief="flat", background=amis_query.CLR_HEAD,
+                     foreground=amis_query.CLR_SUB, padding=(12, 11), borderwidth=0)
+        st.map(REC_STYLE + ".Heading", background=[("active", amis_query.CLR_HEAD_HOVER)],
+               foreground=[("active", amis_query.CLR_PRIMARY)])
+
+    def _record_row_parts(self, rec):
+        """记录 → (「路径/描述」文本, 其余列的值列表)。
+
+        「路径/描述」提到 tree 列（#0）——ttk.Treeview 只有该列能渲染图片，
+        截图行因此可在该列直接显示缩略图（不再展示冗长的文件路径）。
+        列定义仅取展示列 REC_DISPLAY_FIELDS（已隐藏证据Key / 处罚时长 / 外挂名）。
+        """
+        full = ace_record_display_row(rec)
+        try:
+            idx = REC_DISPLAY_FIELDS.index(REC_DES_FIELD)
+        except ValueError:
+            return "", full
+        des_text = full[idx]
+        if str(rec.get("data_type") or "") == "screenshot":
+            des_text = ""                        # 截图行该格只放缩略图
+        return des_text, [v for i, v in enumerate(full) if i != idx]
+
+    def _build_record_table(self, parent, height=8):
+        cols_def = [c for c in ace_record_display_columns() if c[1] != REC_DES_FIELD]
+        heads = [c[0] for c in cols_def]
+        cols = [c[1] for c in cols_def]
+        widths = [ACE_RECORD_WIDTHS.get(c[1], 140) for c in cols_def]
+        des_head = REC_DES_HEADER
+
+        self._ensure_record_style()
+        tree = ttk.Treeview(parent, columns=cols, show="tree headings",
+                            style=REC_STYLE, height=height, selectmode="browse")
+        # #0 = 「路径/描述」（截图行显示缩略图，其余行显示文字），其余列同在各列
+        tree.heading("#0", text=des_head)
+        tree.column("#0", width=ACE_RECORD_WIDTHS.get(REC_DES_FIELD, 430),
+                    anchor="center", stretch=True)
+        for c, h, w in zip(cols, heads, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="center", stretch=(c == REC_DES_FIELD))
+        tree.tag_configure("odd", background=amis_query.CLR_ZEBRA)
+        tree.tag_configure("even", background=amis_query.CLR_CARD)
+
+        ysb = amis_query.MScrollbar(parent, target=tree, orient="vertical",
+                                    thickness=14, bg=amis_query.CLR_CARD)
+        xsb = amis_query.MScrollbar(parent, target=tree, orient="horizontal",
+                                    thickness=14, bg=amis_query.CLR_CARD)
+        tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+        # 单击缩略图看大图改用「松开」触发：这样按住拖动可框选单元格区域复制
+        tree.bind("<ButtonRelease-1>", self._on_record_click)
+        tree.bind("<Configure>", self._on_tree_resize)   # 列宽变化后重渲染缩略图居中
+        amis_query.enable_copy(tree, headers=[des_head] + heads,
+                               row_provider=self._rec_row_values,
+                               image_provider=self._shot_image_bytes)
+        return tree
+
+    def _shot_image_bytes(self, iid, idx, fetch=True):
+        """截图格（第 0 列）的图片字节：供「复制图片」使用。
+
+        fetch=False 时只查缓存（右键菜单判断该格是不是图片格，不触发下载）。
+        """
+        info = self._shot_rows.get(iid)
+        if not info or idx != 0:
+            return None
+        raw = self._shot_raw.get(iid)
+        if raw or not fetch:
+            return raw
+        url = info.get("url")
         if not url:
-            self.strip.set_text(i, "无图片地址")
+            return None
+        try:
+            raw = ace_query.download_image(url, self.cookies)
+        except Exception:
+            return None
+        self._shot_raw[iid] = raw
+        return raw
+
+    def _rec_row_values(self, iid):
+        """复制用取值：截图行复制原始「路径/描述」（界面上显示的是缩略图）"""
+        text = str(self.tree_rec.item(iid, "text") or "")
+        info = self._shot_rows.get(iid)
+        if info:
+            rec = info.get("rec") or {}
+            text = str(rec.get("des") or text)
+        return [text] + ["" if v is None else str(v)
+                         for v in self.tree_rec.item(iid, "values")]
+
+    def _on_record_click(self, event):
+        """单击「路径/描述」列里的缩略图 → 看大图；未装 Pillow 时改为浏览器打开原图。
+
+        缩略图已铺满该列（画布居中），故该列内任意位置点击都视为命中缩略图。
+        注意：拖动框选单元格时不弹大图（由 enable_copy 置的拖动标记判断）。
+        """
+        tree = event.widget
+        if getattr(tree, "_copy_drag_moved", False):
+            return
+        row = tree.identify_row(event.y)
+        info = self._shot_rows.get(row)
+        if not info:
+            return
+        if str(tree.identify_column(event.x)) != "#0":
             return
         if not HAS_PIL:
-            self.strip.set_text(i, "未装 Pillow\n单击用浏览器打开")
+            self._open_in_browser(info.get("url"))
             return
-        threading.Thread(target=self._shot_worker, args=(i, url), daemon=True).start()
+        self._show_big(info["rec"], info["url"])
 
-    def _shot_worker(self, i, url):
-        """后台线程只负责「下载」：ImageTk.PhotoImage 只能在主线程创建，且
-        子线程调 widget.after() 不可靠，故解码统一交回主线程（经 _ui_q 轮询）。
+    def _thumb_worker(self, iid, url, rec):
+        """缩略图：后台线程只负责「下载」，解码与 PhotoImage 交回主线程。
+
+        Tk 限制：ImageTk.PhotoImage 只能在主线程创建，且从子线程调用
+        widget.after() 也不可靠（会抛 RuntimeError: main thread is not in
+        main loop），故统一走 _ui_q 队列由主线程轮询执行。
         """
         try:
             raw = ace_query.download_image(url, self.cookies)
         except Exception:
-            self._ui(lambda: self._shot_failed(i))
+            self._ui(lambda: self._mark_thumb_failed(iid))
             return
-        self._ui(lambda: self._apply_shot(i, raw))
+        self._ui(lambda: self._apply_thumb(iid, raw))
 
-    def _shot_failed(self, i):
-        if self.strip is not None:
-            self.strip.set_text(i, "缩略图加载失败\n右键可重试")
-
-    def _apply_shot(self, i, raw):
-        """主线程：缓存原图字节（供「复制图片」）+ 解码缩略图并显示"""
+    def _mark_thumb_failed(self, iid):
+        """缩略图下载失败：给出可点击的重试提示（整格点击会重新下载并弹大图）"""
         try:
-            if not self.winfo_exists() or self.strip is None:
+            if self.winfo_exists():
+                self.tree_rec.item(iid, text="缩略图加载失败（点击重试）")
+        except Exception:
+            pass
+
+    def _apply_thumb(self, iid, raw):
+        """主线程：解码缩略图并缓存，再按当前列宽渲染到「路径/描述」列"""
+        try:
+            if not self.winfo_exists():
                 return
-            self._shot_raw[i] = raw
+            self._shot_raw[iid] = raw          # 原图字节留用（右键「复制图片」）
             img = Image.open(io.BytesIO(raw))
-            img.thumbnail(ShotStrip.THUMB)
-            self.strip.set_photo(i, ImageTk.PhotoImage(img))
+            img.thumbnail(REC_THUMB_SIZE)
+            self._thumb_imgs[iid] = img
+            self._render_thumb(iid)
         except Exception:
-            self._shot_failed(i)
+            self._mark_thumb_failed(iid)
 
-    def _shot_raw_bytes(self, i):
-        """取该格原图字节（缓存里没有就现下载），供「复制图片」用"""
-        raw = self._shot_raw.get(i)
-        if raw:
-            return raw
-        it = self.strip.item(i) if self.strip is not None else None
-        url = (it or {}).get("url")
-        if not url:
-            return None
+    def _render_thumb(self, iid):
+        """把缩略图合成到「与列同宽的透明画布」后再挂到 tree 列（#0）。
+
+        ttk 的 tree 列对图片不响应 anchor="center"（图片恒贴左），
+        故用透明画布补齐左右空白来实现视觉居中；列宽随窗口变化时重渲染。
+        """
+        img = self._thumb_imgs.get(iid)
+        if img is None:
+            return
         try:
-            raw = ace_query.download_image(url, self.cookies)
-        except Exception:
-            return None
-        self._shot_raw[i] = raw
-        return raw
-
-    def _show_shot(self, i):
-        """单击缩略图 → 看大图；未装 Pillow 时退回浏览器打开"""
-        it = self.strip.item(i) if self.strip is not None else None
-        if not it or not it.get("url"):
-            return
-        if not HAS_PIL:
-            self._open_in_browser(it.get("url"))
-            return
-        self._show_big(it.get("rec") or {}, it["url"])
-
-    def _browser_shot(self, i):
-        it = self.strip.item(i) if self.strip is not None else None
-        if it:
-            self._open_in_browser(it.get("url"))
-
-    def _copy_shot(self, i):
-        """复制图片：可能要先下载，放后台线程；剪贴板写入回主线程"""
-        def work():
-            raw = self._shot_raw_bytes(i)
-            if not raw:
-                self._ui(lambda: messagebox.showwarning(
-                    "复制图片", "图片下载失败，请重试或改用「浏览器打开原图」。",
-                    parent=self))
+            if not self.winfo_exists():
                 return
-            self._ui(lambda: amis_query.copy_image_bytes(self, raw))
-        threading.Thread(target=work, daemon=True).start()
+            col_w = int(self.tree_rec.column("#0", "width"))
+            col_w = max(col_w, img.width + 24)
+            canvas = Image.new("RGBA", (col_w, REC_THUMB_CANVAS_H), (0, 0, 0, 0))
+            canvas.paste(img, ((col_w - img.width) // 2,
+                               (REC_THUMB_CANVAS_H - img.height) // 2))
+            photo = ImageTk.PhotoImage(canvas)
+            self._thumbs[iid] = photo          # 保持引用，防止被回收
+            self.tree_rec.item(iid, image=photo)
+            info = self._shot_rows.get(iid)
+            if info is not None:
+                info["w"] = photo.width()
+        except Exception:
+            pass
+
+    def _on_tree_resize(self, _event=None):
+        """列宽变化（窗口缩放）后重渲染缩略图，保持居中（去抖 120ms）"""
+        if self._thumb_after is not None:
+            try:
+                self.after_cancel(self._thumb_after)
+            except Exception:
+                pass
+        try:
+            self._thumb_after = self.after(120, self._render_all_thumbs)
+        except Exception:
+            self._thumb_after = None
+
+    def _render_all_thumbs(self):
+        self._thumb_after = None
+        for iid in list(self._thumb_imgs):
+            self._render_thumb(iid)
 
     def _show_big(self, rec, url):
         def work():
@@ -4301,69 +4266,6 @@ def _check_resultview(check, warn):
         warn("结果区全部居中显示", "打包版没有 .py 源码，跳过该源码级检查")
 
 
-def _class_source(src, name):
-    """从整份源码里切出某个顶层类的代码块（自检做源码级断言时用）
-
-    打包成 exe 后没有 .py 源码，调用方会传空串进来，这里只需不炸即可。
-    """
-    if not src:
-        return ""
-    marker = "class " + name
-    start = src.find(marker)
-    if start < 0:
-        return ""
-    out = []
-    for line in src[start:].splitlines():
-        if out and line.startswith(("class ", "def ")):
-            break
-        out.append(line)
-    return "\n".join(out)
-
-
-def _check_detail_views(check, warn):
-    """自检两个明细弹窗：都已改成与主结果区一致的纯文本视图
-
-    明细此前是 Treeview（只能整格选中 / 框选），用户要求统一成可直接拖动
-    选字。ACE 明细的「可疑用户核查」原本把截图缩略图塞在表格格子里，改文本
-    视图后图片没法内嵌，因此挪到下方的截图缩略图带（ShotStrip）。
-    """
-    ok = (all(hasattr(amis_query, n) for n in ("DetailDialog", "ResultTextView"))
-          and hasattr(ShotStrip, "add") and hasattr(ShotStrip, "set_photo"))
-    check("明细弹窗可用", ok,
-          "DetailDialog / ResultTextView / ShotStrip 存在")
-
-    # 列定义自洽 + 缩略图带尺寸合理
-    dq_ok = len(ACE_DQ_WIDTHS) == len(ace_query.DQ_COLUMNS)
-    rec_ok = all(ACE_RECORD_WIDTHS.get(f) for f in REC_DISPLAY_FIELDS)
-    strip_ok = (ShotStrip.THUMB[0] > 0 and ShotStrip.THUMB[1] > 0
-                and ShotStrip.THUMB[1] + 34 <= ShotStrip.CELL_H)
-    check("明细列宽自洽", dq_ok and rec_ok and strip_ok,
-          "ACE 数据查询 %d 列 / 核查展示 %d 列 / 缩略图上限 %s"
-          % (len(ACE_DQ_WIDTHS), len(REC_DISPLAY_FIELDS), ShotStrip.THUMB))
-
-    # 源码级：两个弹窗都不再建 ttk 表格（标记串拼接写，避免断言自我满足）
-    try:
-        _jq = open(os.path.join(SCRIPT_DIR, "joint_query.py"), encoding="utf-8").read()
-    except Exception:
-        _jq = ""
-    try:
-        _aq = open(os.path.join(SCRIPT_DIR, "src", "amis_query.py"), encoding="utf-8").read()
-    except Exception:
-        _aq = ""
-    if _jq and _aq:
-        build = "build" + "_table("
-        rtv = "Result" + "TextView("
-        strip = "Shot" + "Strip("
-        d = _class_source(_aq, "DetailDialog")
-        a = _class_source(_jq, "AceDetailDialog")
-        check("明细已统一为文本视图",
-              bool(d) and bool(a) and build not in d and build not in a
-              and rtv in d and rtv in a and strip in a,
-              "封禁明细 / ACE 明细均改用 ResultTextView；ACE 截图走缩略图带")
-    else:
-        warn("明细已统一为文本视图", "打包版没有 .py 源码，跳过该源码级检查")
-
-
 def selfcheck():
     """离线自检：模块接口、编号识别、结果渲染与 CSV 导出逻辑（不联网）"""
     ok = True
@@ -4393,7 +4295,6 @@ def selfcheck():
                                "MTabView", "build_table", "MScrollbar", "DetailDialog")),
           "RoundBox / MButton / MTextField / Segmented / MTabView / build_table / DetailDialog 存在")
     _check_resultview(check, warn)
-    _check_detail_views(check, warn)
     check("表格复制能力可用", all(hasattr(amis_query, n) for n in
                                   ("enable_copy", "copy_rows", "copy_cell", "tree_row_values",
                                    "copy_range", "range_bounds", "display_columns",
